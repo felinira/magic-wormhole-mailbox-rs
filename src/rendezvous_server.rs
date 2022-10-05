@@ -6,21 +6,60 @@ use self::state::RendezvousServerState;
 use crate::core::{Mailbox, Nameplate};
 use crate::server_messages::*;
 use async_std::net::TcpStream;
+use async_tungstenite::tungstenite::Error;
 use async_tungstenite::{tungstenite, WebSocketStream};
+use futures::future::err;
 use futures::stream::FusedStream;
 use futures::{select, FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
+use std::fmt::{Display, Formatter};
 use std::time::Duration;
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiveError {
+    #[error("Error parsing JSON message: {:?}", _0)]
+    JsonParse(String),
+    #[error("Received unexpected message type: {}", _0)]
+    UnexpectedType(tungstenite::Message),
+    #[error("WebSocket receive error: {}", source)]
+    WebSocket {
+        #[from]
+        #[source]
+        source: tungstenite::Error,
+    },
+    #[error("WebSocket closed")]
+    Closed,
+}
 
 pub struct RendezvousServer {
     listener: async_std::net::TcpListener,
     state: RendezvousServerState,
 }
 
+#[derive(Debug, thiserror::Error)]
+pub enum ClientConnectionError {
+    #[error("ReceiveError: {}", source)]
+    Receive {
+        #[from]
+        #[source]
+        source: ReceiveError,
+    },
+    #[error("Received unexpected message: {}", _0)]
+    UnexpectedMessage(ClientMessage),
+    #[error("Too many clients connected")]
+    TooManyClients,
+    #[error("Not connected to mailbox {}", _0)]
+    NotConnectedToMailbox(String),
+    #[error("An internal inconsistency has been found")]
+    Inconsistency,
+}
+
 impl RendezvousServer {
-    pub async fn new() -> Result<Self, std::io::Error> {
-        let addrs: [async_std::net::SocketAddr; 2] =
-            ["[::]:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap()];
+    pub async fn new(port: u16) -> Result<Self, std::io::Error> {
+        let addrs: [async_std::net::SocketAddr; 2] = [
+            format!("[::]:{}", port).parse().unwrap(),
+            format!("0.0.0.0:{}", port).parse().unwrap(),
+        ];
         let listener = async_std::net::TcpListener::bind(&addrs[..]).await?;
         Ok(Self {
             listener,
@@ -28,36 +67,45 @@ impl RendezvousServer {
         })
     }
 
+    #[must_use]
     async fn send_msg(stream: &mut WebSocketStream<TcpStream>, msg: &ServerMessage) {
         let json = serde_json::to_string(msg).unwrap();
         println!("Send: {}", json);
         stream.send(json.into()).await.unwrap();
     }
 
-    async fn protocol_error(mut ws: &mut WebSocketStream<TcpStream>) {
-        println!("Failure condition");
+    async fn handle_error(mut ws: &mut WebSocketStream<TcpStream>, error: ClientConnectionError) {
+        println!("An error occurred: {}", error);
         println!("Backtrace: {:?}", backtrace::Backtrace::new());
-        Self::send_msg(&mut ws, &ServerMessage::Unknown).await;
+        Self::send_msg(
+            &mut ws,
+            &ServerMessage::Error {
+                error: error.to_string(),
+                orig: Box::new(ServerMessage::Unknown),
+            },
+        )
+        .await;
     }
 
-    async fn fail_close_mailbox(
+    async fn handle_error_close_mailbox(
         mut ws: &mut WebSocketStream<TcpStream>,
         state: RendezvousServerState,
         nameplate: &str,
+        error: ClientConnectionError,
     ) {
-        println!("Failure condition");
-        println!("Backtrace: {:?}", backtrace::Backtrace::new());
-        Self::send_msg(&mut ws, &ServerMessage::Unknown).await;
+        Self::handle_error(ws, error);
         state
             .write()
             .unwrap()
             .mailboxes_mut()
             .get_mut(nameplate)
-            .map(|m| m.close_all());
+            .map(|m| m.close_mailbox());
         state.write().unwrap().mailboxes_mut().remove(nameplate);
     }
 
-    async fn receive_msg(ws: &mut WebSocketStream<TcpStream>) -> Result<ClientMessage, ()> {
+    async fn receive_msg(
+        ws: &mut WebSocketStream<TcpStream>,
+    ) -> Result<ClientMessage, ReceiveError> {
         if let Some(msg) = ws.next().await {
             match msg {
                 Ok(msg) => {
@@ -67,32 +115,27 @@ impl RendezvousServer {
                         if let Ok(client_msg) = client_msg {
                             Ok(client_msg)
                         } else {
-                            println!("Error parsing message: {:?}", client_msg);
-                            Err(())
+                            Err(ReceiveError::JsonParse(msg_txt))
                         }
                     } else {
-                        println!("Receive unknown message: {}", msg);
-                        Err(())
+                        Err(ReceiveError::UnexpectedType(msg))
                     }
                 }
-                Err(err) => {
-                    println!("Error: {}", err);
-                    Err(())
-                }
+                Err(err) => Err(err.into()),
             }
         } else {
-            println!("No message");
-            Err(())
+            Err(ReceiveError::Closed)
         }
     }
 
+    #[must_use]
     async fn handle_client_msg(
         client_id: &str,
         nameplate: &str,
         state: RendezvousServerState,
         mut ws: &mut WebSocketStream<TcpStream>,
         client_msg: ClientMessage,
-    ) -> Result<(), ()> {
+    ) -> Result<(), ClientConnectionError> {
         match client_msg {
             ClientMessage::Add { phase, body } => {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
@@ -106,11 +149,11 @@ impl RendezvousServer {
 
                 // send the message to the broadcast channel
                 broadcast
-                    .send(ServerMessage::Message(EncryptedMessage {
+                    .broadcast(EncryptedMessage {
                         side: client_id.into(),
                         phase: phase.clone(),
                         body: body.clone(),
-                    }))
+                    })
                     .await
                     .unwrap();
 
@@ -133,8 +176,7 @@ impl RendezvousServer {
                     Self::send_msg(&mut ws, &ServerMessage::Released).await;
                     Ok(())
                 } else {
-                    Self::fail_close_mailbox(&mut ws, state.clone(), &nameplate).await;
-                    Err(())
+                    Err(ClientConnectionError::NotConnectedToMailbox(nameplate))
                 }
             }
             ClientMessage::Close { mailbox, mood } => {
@@ -154,22 +196,17 @@ impl RendezvousServer {
                     Self::send_msg(&mut ws, &ServerMessage::Closed).await;
                     Ok(())
                 } else {
-                    Self::fail_close_mailbox(&mut ws, state.clone(), &nameplate).await;
-                    Err(())
+                    Err(ClientConnectionError::NotConnectedToMailbox(mailbox.0))
                 }
             }
-            _ => {
-                println!("Received unknown message: {}", client_msg);
-                Self::fail_close_mailbox(&mut ws, state.clone(), nameplate).await;
-                Err(())
-            }
+            _ => Err(ClientConnectionError::UnexpectedMessage(client_msg)),
         }
     }
 
     async fn ws_handler(
         state: RendezvousServerState,
-        mut ws: WebSocketStream<TcpStream>,
-    ) -> Result<(), ()> {
+        ws: &mut WebSocketStream<TcpStream>,
+    ) -> Result<(), ClientConnectionError> {
         #[allow(deprecated)]
         let welcome = ServerMessage::Welcome {
             welcome: WelcomeMessage {
@@ -179,18 +216,17 @@ impl RendezvousServer {
                 permission_required: None,
             },
         };
-        Self::send_msg(&mut ws, &welcome).await;
+        Self::send_msg(ws, &welcome).await;
 
-        let msg = Self::receive_msg(&mut ws).await?;
+        let msg = Self::receive_msg(ws).await?;
         let client_id = match msg {
             ClientMessage::Bind { appid, side } => {
                 // TODO: scope by app id
-                Self::send_msg(&mut ws, &ServerMessage::Ack).await;
+                Self::send_msg(ws, &ServerMessage::Ack).await;
                 (**(side)).to_string()
             }
             _ => {
-                Self::protocol_error(&mut ws).await;
-                return Err(());
+                return Err(ClientConnectionError::UnexpectedMessage(msg));
             }
         };
 
@@ -199,27 +235,26 @@ impl RendezvousServer {
 
         while !claimed {
             // Allocate or claim are the only two messages that can come now
-            let msg = Self::receive_msg(&mut ws).await?;
+            let msg = Self::receive_msg(ws).await?;
             match &msg {
                 ClientMessage::Allocate => {
                     let allocation = state.write().unwrap().allocate(&client_id);
 
                     if let Some(allocation) = allocation {
-                        Self::send_msg(&mut ws, &ServerMessage::Ack).await;
+                        Self::send_msg(ws, &ServerMessage::Ack).await;
                         Self::send_msg(
-                            &mut ws,
+                            ws,
                             &ServerMessage::Allocated {
                                 nameplate: Nameplate::new(&allocation),
                             },
                         )
                         .await;
                     } else {
-                        Self::protocol_error(&mut ws).await;
-                        return Err(());
+                        return Err(ClientConnectionError::UnexpectedMessage(msg));
                     }
                 }
                 ClientMessage::Claim { nameplate } => {
-                    Self::send_msg(&mut ws, &ServerMessage::Ack).await;
+                    Self::send_msg(ws, &ServerMessage::Ack).await;
                     println!("Claiming nameplate: {}", nameplate);
 
                     if state
@@ -228,18 +263,10 @@ impl RendezvousServer {
                         .try_claim(&nameplate, &client_id)
                         .is_none()
                     {
-                        Self::send_msg(
-                            &mut ws,
-                            &ServerMessage::Error {
-                                error: "Too many clients connected".to_string(),
-                                orig: Box::new(ServerMessage::Unknown),
-                            },
-                        )
-                        .await;
-                        return Err(());
+                        return Err(ClientConnectionError::TooManyClients);
                     } else {
                         Self::send_msg(
-                            &mut ws,
+                            ws,
                             &ServerMessage::Claimed {
                                 mailbox: Mailbox(nameplate.to_string()),
                             },
@@ -250,84 +277,77 @@ impl RendezvousServer {
                     }
                 }
                 _ => {
-                    Self::protocol_error(&mut ws).await;
-                    return Err(());
+                    return Err(ClientConnectionError::UnexpectedMessage(msg));
                 }
             };
         }
 
         // Now we wait for an open message
-        let msg = Self::receive_msg(&mut ws).await?;
+        let msg = Self::receive_msg(ws).await?;
 
         match msg {
             ClientMessage::Open { mailbox } => {
-                if state
-                    .read()
+                let opened = state
+                    .write()
                     .unwrap()
-                    .nameplate_has_client(&mailbox.0, &client_id)
-                {
-                    let opened = state
-                        .write()
-                        .unwrap()
-                        .mailboxes_mut()
-                        .get_mut(&mailbox.0)
-                        .unwrap()
-                        .open(&client_id);
-                    if opened {
-                        Self::send_msg(&mut ws, &ServerMessage::Ack).await;
-                    } else {
-                        Self::fail_close_mailbox(&mut ws, state.clone(), &client_nameplate).await;
-                        return Err(());
-                    }
+                    .mailboxes_mut()
+                    .get_mut(&mailbox.0)
+                    .unwrap()
+                    .open(&client_id);
+                if opened {
+                    Self::send_msg(ws, &ServerMessage::Ack).await;
                 } else {
-                    Self::fail_close_mailbox(&mut ws, state.clone(), &client_nameplate).await;
-                    return Err(());
+                    return Err(ClientConnectionError::NotConnectedToMailbox(mailbox.0));
                 }
             }
             _ => {
-                Self::fail_close_mailbox(&mut ws, state.clone(), &client_nameplate).await;
-                return Err(());
+                return Err(ClientConnectionError::UnexpectedMessage(msg));
             }
         }
 
-        let broadcast_receiver = state
+        let mut broadcast_receiver = state
             .write()
             .unwrap()
             .mailboxes_mut()
             .get_mut(&client_nameplate)
             .unwrap()
-            .broadcast_receiver();
+            .new_broadcast_receiver();
 
         // Now we are operating on the open channel
         while !ws.is_terminated() {
-            let mut client_future = Box::pin(Self::receive_msg(&mut ws)).fuse();
+            let mut client_future = Box::pin(Self::receive_msg(ws)).fuse();
             let mut broadcast_future = Box::pin(broadcast_receiver.recv()).fuse();
 
             select! {
-                msg = client_future => {
+                msg_res = client_future => {
                     drop(client_future);
-                    if let Ok(msg) = msg {
-                        Self::handle_client_msg(&client_id, &client_nameplate, state.clone(), &mut ws, msg).await.unwrap();
-                    } else {
-                        Self::protocol_error(&mut ws).await;
-                        break;
+                    match msg_res {
+                        Ok(msg) => {
+                            Self::handle_client_msg(&client_id, &client_nameplate, state.clone(), ws, msg).await.unwrap();
+                        },
+                        Err(err) => {
+                            println!("Message receive error: {}", err);
+                            Self::handle_error_close_mailbox(ws, state.clone(), &client_nameplate, err.into()).await;
+                            break;
+                        }
                     }
                 },
-                msg = broadcast_future => {
+                msg_res = broadcast_future => {
                     drop(client_future);
-                    if let Ok(msg) = msg {
-                        println!("Sending msg: {} to peer {}", msg, client_id);
-                        Self::send_msg(&mut ws, &msg).await;
-                    } else {
-                        Self::protocol_error(&mut ws).await;
-                        break;
+                    match msg_res {
+                        Ok(msg) => {
+                            println!("Sending msg: {} to peer {}", msg, client_id);
+                            Self::send_msg(ws, &ServerMessage::Message(msg)).await;
+                        },
+                        Err(err) => {
+                            println!("Message Broadcast error: {}", err);
+                            Self::handle_error(ws, ClientConnectionError::Inconsistency).await;
+                            break;
+                        }
                     }
                 }
             }
         }
-
-        println!("Websocket connection terminated");
-        let _ = ws.close(None).await;
 
         Ok(())
     }
@@ -340,8 +360,17 @@ impl RendezvousServer {
                 let state = self.state.clone();
                 async_std::task::spawn(async move {
                     let ws = async_tungstenite::accept_async(stream).await;
-                    if let Ok(ws) = ws {
-                        Self::ws_handler(state, ws).await.unwrap();
+                    if let Ok(mut ws) = ws {
+                        Self::ws_handler(state, &mut ws).await.unwrap();
+                        let res = ws.close(None).await;
+                        match res {
+                            Ok(()) => {
+                                println!("Websocket connection terminated");
+                            }
+                            Err(err) => {
+                                println!("Websocket connection error: {}", err);
+                            }
+                        }
                     }
                 });
             }

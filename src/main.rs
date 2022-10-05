@@ -12,7 +12,9 @@ mod zeroconf;
 
 #[async_std::main]
 async fn main() {
-    let mut mailbox = rendezvous_server::RendezvousServer::new().await.unwrap();
+    let mut mailbox = rendezvous_server::RendezvousServer::new(8080)
+        .await
+        .unwrap();
     println!("Listening with mailbox port: {}", mailbox.port());
 
     let service = ZeroconfService::run(mailbox.port());

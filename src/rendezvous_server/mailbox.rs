@@ -1,7 +1,7 @@
 use crate::server_messages::{EncryptedMessage, ServerMessage};
 
-pub type MessageChannelSender = async_channel::Sender<ServerMessage>;
-pub type MessageChannelReceiver = async_channel::Receiver<ServerMessage>;
+pub type BroadcastSender = async_broadcast::Sender<EncryptedMessage>;
+pub type BroadcastReceiver = async_broadcast::Receiver<EncryptedMessage>;
 
 pub(crate) struct MailboxClient {
     id: String,
@@ -47,9 +47,8 @@ impl MailboxClient {
 
 pub(crate) struct ClaimedMailbox {
     clients: Vec<MailboxClient>,
-    broadcast_sender: MessageChannelSender,
-    broadcast_receiver: MessageChannelReceiver,
-    message_history: Vec<EncryptedMessage>,
+    broadcast_sender: BroadcastSender,
+    broadcast_receiver: BroadcastReceiver,
     creation_time: std::time::Instant,
     last_activity: std::time::Instant,
 }
@@ -60,13 +59,12 @@ impl ClaimedMailbox {
         let mut clients = Vec::with_capacity(2);
         clients.push(MailboxClient::new(first_client_id));
 
-        let (broadcast_sender, broadcast_receiver) = async_channel::unbounded();
+        let (broadcast_sender, broadcast_receiver) = async_broadcast::broadcast(1024);
 
         Self {
             clients,
             broadcast_sender,
             broadcast_receiver,
-            message_history: Vec::new(),
             creation_time: now,
             last_activity: now,
         }
@@ -128,8 +126,10 @@ impl ClaimedMailbox {
         false
     }
 
-    pub fn close_all(&mut self) {
-        self.clients.iter_mut().for_each(|client| client.close())
+    pub async fn close_mailbox(&mut self) {
+        self.clients.iter_mut().for_each(|client| client.close());
+        self.broadcast_receiver.close();
+        self.broadcast_sender.close();
     }
 
     pub fn close_client(&mut self, client_id: &str) -> bool {
@@ -143,11 +143,14 @@ impl ClaimedMailbox {
         return false;
     }
 
-    pub fn broadcast_receiver(&self) -> MessageChannelReceiver {
+    /// This will clone the receiver that is stored in this mailbox.
+    /// As the stored receiver is never read, all messages will be retained until the mailbox is
+    /// closed. They will be replayed for each new connection to the mailbox.
+    pub fn new_broadcast_receiver(&self) -> BroadcastReceiver {
         self.broadcast_receiver.clone()
     }
 
-    pub fn broadcast_sender(&self) -> MessageChannelSender {
+    pub fn broadcast_sender(&self) -> BroadcastSender {
         self.broadcast_sender.clone()
     }
 
