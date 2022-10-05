@@ -3,7 +3,7 @@ mod state;
 
 use self::mailbox::ClaimedMailbox;
 use self::state::RendezvousServerState;
-use crate::core::{Mailbox, Nameplate};
+use crate::core::{EitherSide, Mailbox, Nameplate, TheirSide};
 use crate::server_messages::*;
 use async_std::net::TcpStream;
 use async_tungstenite::tungstenite::Error;
@@ -94,7 +94,7 @@ impl RendezvousServer {
         mut ws: &mut WebSocketStream<TcpStream>,
         state: RendezvousServerState,
         nameplate: &str,
-        client_id: &str,
+        client_id: &EitherSide,
         error: ClientConnectionError,
     ) {
         Self::handle_error(ws, error);
@@ -138,7 +138,7 @@ impl RendezvousServer {
 
     #[must_use]
     async fn handle_client_msg(
-        client_id: &str,
+        client_id: &EitherSide,
         nameplate: &str,
         state: RendezvousServerState,
         mut ws: &mut WebSocketStream<TcpStream>,
@@ -158,7 +158,7 @@ impl RendezvousServer {
                 // send the message to the broadcast channel
                 broadcast
                     .broadcast(EncryptedMessage {
-                        side: client_id.into(),
+                        side: client_id.0.clone().into(),
                         phase: phase.clone(),
                         body: body.clone(),
                     })
@@ -227,11 +227,11 @@ impl RendezvousServer {
         Self::send_msg(ws, &welcome).await;
 
         let msg = Self::receive_msg(ws).await?;
-        let client_id = match msg {
+        let client_id: EitherSide = match msg {
             ClientMessage::Bind { appid, side } => {
                 // TODO: scope by app id
                 Self::send_msg(ws, &ServerMessage::Ack).await;
-                (**(side)).to_string()
+                EitherSide(side.0.clone())
             }
             _ => {
                 return Err(ClientConnectionError::UnexpectedMessage(msg));
@@ -268,7 +268,7 @@ impl RendezvousServer {
                     if state
                         .write()
                         .unwrap()
-                        .try_claim(&nameplate, &client_id)
+                        .try_claim(&nameplate, client_id.clone())
                         .is_none()
                     {
                         return Err(ClientConnectionError::TooManyClients);
