@@ -142,6 +142,7 @@ impl RendezvousServer {
                         println!("Receive: {}", msg_txt);
                         let client_msg = serde_json::from_str(&msg_txt);
                         if let Ok(client_msg) = client_msg {
+                            Self::send_msg(ws, &ServerMessage::Ack);
                             Ok(client_msg)
                         } else {
                             Err(ReceiveError::JsonParse(msg_txt))
@@ -167,7 +168,6 @@ impl RendezvousServer {
     ) -> Result<(), ClientConnectionError> {
         match client_msg {
             ClientMessage::Add { phase, body } => {
-                Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 let mut broadcast = state
                     .write()
                     .mailbox_mut(mailbox_id)
@@ -194,7 +194,6 @@ impl RendezvousServer {
                 Ok(())
             }
             ClientMessage::Release { nameplate } => {
-                Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 let released = {
                     let mut released = false;
                     if let Some(mailbox) = state
@@ -218,7 +217,6 @@ impl RendezvousServer {
                 }
             }
             ClientMessage::Close { mailbox, mood } => {
-                Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 println!("Closed mailbox for client: {}. Mood: {}", client_id, mood);
                 let closed = {
                     if let Some(mailbox) = state.write().mailboxes_mut().get_mut(&mailbox) {
@@ -258,7 +256,6 @@ impl RendezvousServer {
         let client_id: EitherSide = match msg {
             ClientMessage::Bind { appid, side } => {
                 // TODO: scope by app id
-                Self::send_msg(ws, &ServerMessage::Ack).await;
                 EitherSide(side.0.clone())
             }
             _ => {
@@ -277,7 +274,6 @@ impl RendezvousServer {
                     let allocation = state.write().allocate(&client_id);
 
                     if let Some(allocation) = allocation {
-                        Self::send_msg(ws, &ServerMessage::Ack).await;
                         Self::send_msg(
                             ws,
                             &ServerMessage::Allocated {
@@ -290,7 +286,6 @@ impl RendezvousServer {
                     }
                 }
                 ClientMessage::Claim { nameplate } => {
-                    Self::send_msg(ws, &ServerMessage::Ack).await;
                     println!("Claiming nameplate: {}", nameplate);
 
                     if state
@@ -328,9 +323,7 @@ impl RendezvousServer {
                     .get_mut(&mailbox)
                     .unwrap()
                     .open_client(&client_id);
-                if opened {
-                    Self::send_msg(ws, &ServerMessage::Ack).await;
-                } else {
+                if !opened {
                     return Err(ClientConnectionError::NotConnectedToMailbox(mailbox));
                 }
             }
