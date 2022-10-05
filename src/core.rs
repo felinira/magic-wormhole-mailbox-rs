@@ -154,12 +154,26 @@ impl Phase {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display)]
+#[derive(Hash, PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display)]
 #[serde(transparent)]
 pub struct Mailbox(pub String);
 
+impl From<Nameplate> for Mailbox {
+    fn from(nameplate: Nameplate) -> Self {
+        Mailbox(nameplate.0)
+    }
+}
+
 #[derive(
-    PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display, derive_more::Deref,
+    Hash,
+    PartialEq,
+    Eq,
+    Clone,
+    Debug,
+    Deserialize,
+    Serialize,
+    derive_more::Display,
+    derive_more::Deref,
 )]
 #[serde(transparent)]
 #[deref(forward)]
@@ -174,6 +188,12 @@ impl Nameplate {
 impl Into<String> for Nameplate {
     fn into(self) -> String {
         self.0
+    }
+}
+
+impl From<String> for Nameplate {
+    fn from(string: String) -> Self {
+        Nameplate(string)
     }
 }
 

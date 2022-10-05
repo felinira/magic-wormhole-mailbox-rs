@@ -49,7 +49,7 @@ pub enum ClientConnectionError {
     #[error("Too many clients connected")]
     TooManyClients,
     #[error("Not connected to mailbox {}", _0)]
-    NotConnectedToMailbox(String),
+    NotConnectedToMailbox(Mailbox),
     #[error("An internal inconsistency has been found")]
     Inconsistency,
 }
@@ -93,21 +93,21 @@ impl RendezvousServer {
     async fn handle_error_close_mailbox(
         mut ws: &mut WebSocketStream<TcpStream>,
         state: RendezvousServerState,
-        nameplate: &str,
+        mailbox_id: &Mailbox,
         client_id: &EitherSide,
         error: ClientConnectionError,
     ) {
         Self::handle_error(ws, error);
 
         // If the client was closed successfully nothing else to do here
-        if state.client_is_open(nameplate, client_id) {
+        if state.client_is_open(mailbox_id, client_id) {
             state
                 .write()
                 .unwrap()
                 .mailboxes_mut()
-                .get_mut(nameplate)
+                .get_mut(mailbox_id)
                 .map(|m| m.close_mailbox());
-            state.write().unwrap().mailboxes_mut().remove(nameplate);
+            state.write().unwrap().mailboxes_mut().remove(mailbox_id);
         }
     }
 
@@ -139,7 +139,7 @@ impl RendezvousServer {
     #[must_use]
     async fn handle_client_msg(
         client_id: &EitherSide,
-        nameplate: &str,
+        mailbox_id: &Mailbox,
         state: RendezvousServerState,
         mut ws: &mut WebSocketStream<TcpStream>,
         client_msg: ClientMessage,
@@ -151,7 +151,7 @@ impl RendezvousServer {
                     .write()
                     .unwrap()
                     .mailboxes_mut()
-                    .get_mut(nameplate)
+                    .get_mut(mailbox_id.into())
                     .unwrap()
                     .broadcast_sender();
 
@@ -171,8 +171,11 @@ impl RendezvousServer {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 let released = {
                     let mut released = false;
-                    if let Some(mailbox) =
-                        state.write().unwrap().mailboxes_mut().get_mut(&nameplate)
+                    if let Some(mailbox) = state
+                        .write()
+                        .unwrap()
+                        .mailboxes_mut()
+                        .get_mut(&Mailbox(nameplate.clone()))
                     {
                         released = mailbox.close_client(client_id)
                     }
@@ -184,15 +187,16 @@ impl RendezvousServer {
                     Self::send_msg(&mut ws, &ServerMessage::Released).await;
                     Ok(())
                 } else {
-                    Err(ClientConnectionError::NotConnectedToMailbox(nameplate))
+                    Err(ClientConnectionError::NotConnectedToMailbox(Mailbox(
+                        nameplate,
+                    )))
                 }
             }
             ClientMessage::Close { mailbox, mood } => {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 println!("Closed mailbox for client: {}. Mood: {}", client_id, mood);
                 let closed = {
-                    if let Some(mailbox) =
-                        state.write().unwrap().mailboxes_mut().get_mut(&mailbox.0)
+                    if let Some(mailbox) = state.write().unwrap().mailboxes_mut().get_mut(&mailbox)
                     {
                         mailbox.remove_client(client_id)
                     } else {
@@ -204,7 +208,7 @@ impl RendezvousServer {
                     Self::send_msg(&mut ws, &ServerMessage::Closed).await;
                     Ok(())
                 } else {
-                    Err(ClientConnectionError::NotConnectedToMailbox(mailbox.0))
+                    Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
                 }
             }
             _ => Err(ClientConnectionError::UnexpectedMessage(client_msg)),
@@ -239,7 +243,7 @@ impl RendezvousServer {
         };
 
         let mut claimed = false;
-        let mut client_nameplate = String::new();
+        let mut client_mailbox = Mailbox(String::new());
 
         while !claimed {
             // Allocate or claim are the only two messages that can come now
@@ -268,7 +272,7 @@ impl RendezvousServer {
                     if state
                         .write()
                         .unwrap()
-                        .try_claim(&nameplate, client_id.clone())
+                        .try_claim(&Nameplate(nameplate.to_string()), client_id.clone())
                         .is_none()
                     {
                         return Err(ClientConnectionError::TooManyClients);
@@ -281,7 +285,7 @@ impl RendezvousServer {
                         )
                         .await;
                         claimed = true;
-                        client_nameplate = nameplate.to_string();
+                        client_mailbox = Mailbox(nameplate.to_string());
                     }
                 }
                 _ => {
@@ -299,13 +303,13 @@ impl RendezvousServer {
                     .write()
                     .unwrap()
                     .mailboxes_mut()
-                    .get_mut(&mailbox.0)
+                    .get_mut(&mailbox)
                     .unwrap()
                     .open(&client_id);
                 if opened {
                     Self::send_msg(ws, &ServerMessage::Ack).await;
                 } else {
-                    return Err(ClientConnectionError::NotConnectedToMailbox(mailbox.0));
+                    return Err(ClientConnectionError::NotConnectedToMailbox(mailbox));
                 }
             }
             _ => {
@@ -317,7 +321,7 @@ impl RendezvousServer {
             .write()
             .unwrap()
             .mailboxes_mut()
-            .get_mut(&client_nameplate)
+            .get_mut(&client_mailbox)
             .unwrap()
             .new_broadcast_receiver();
 
@@ -331,7 +335,7 @@ impl RendezvousServer {
                     drop(client_future);
                     match msg_res {
                         Ok(msg) => {
-                            Self::handle_client_msg(&client_id, &client_nameplate, state.clone(), ws, msg).await.unwrap();
+                            Self::handle_client_msg(&client_id, &client_mailbox, state.clone(), ws, msg).await.unwrap();
                         },
                         Err(err) => {
                             match err {
@@ -343,7 +347,7 @@ impl RendezvousServer {
                                 },
                                 err => {
                                     println!("Message receive error: {}", err);
-                                    Self::handle_error_close_mailbox(ws, state.clone(), &client_nameplate, &client_id, err.into()).await;
+                                    Self::handle_error_close_mailbox(ws, state.clone(), &client_mailbox, &client_id, err.into()).await;
                                     break;
                                 }
                             }

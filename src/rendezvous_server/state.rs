@@ -1,4 +1,4 @@
-use crate::core::EitherSide;
+use crate::core::{EitherSide, Mailbox, Nameplate};
 use crate::rendezvous_server::mailbox::ClaimedMailbox;
 use derive_more::Deref;
 use std::collections::HashMap;
@@ -10,12 +10,16 @@ const MAX_MAILBOXES: usize = 1024;
 
 #[derive(Default)]
 pub struct RendezvousServerStateInner {
-    mailboxes: HashMap<String, ClaimedMailbox>,
-    allocations: HashMap<String, (EitherSide, std::time::Instant)>,
+    mailboxes: HashMap<Mailbox, ClaimedMailbox>,
+    allocations: HashMap<Nameplate, (EitherSide, std::time::Instant)>,
 }
 
 impl RendezvousServerStateInner {
-    pub(crate) fn try_claim(&mut self, nameplate: &str, client_id: EitherSide) -> Option<String> {
+    pub(crate) fn try_claim(
+        &mut self,
+        nameplate: &Nameplate,
+        client_id: EitherSide,
+    ) -> Option<Mailbox> {
         self.cleanup_allocations();
         self.cleanup_mailboxes();
 
@@ -24,7 +28,9 @@ impl RendezvousServerStateInner {
             return None;
         }
 
-        if self.mailboxes.get(nameplate).is_none() {
+        let mailbox_id = Mailbox(nameplate.to_string());
+
+        if self.mailboxes.get(&mailbox_id).is_none() {
             // We check allocations if the mailbox is not open yet
             if let Some((allocated_client_id, _time)) = self.allocations.get(nameplate) {
                 if &client_id != allocated_client_id {
@@ -36,13 +42,13 @@ impl RendezvousServerStateInner {
             }
 
             self.mailboxes
-                .insert(nameplate.to_string(), ClaimedMailbox::new(client_id));
-            return Some(nameplate.to_string());
-        } else if !self.nameplate_has_client(nameplate, &client_id) {
-            let mailbox = self.mailboxes.get_mut(nameplate);
-            if let Some(mailbox) = mailbox {
-                if mailbox.add_client(client_id).is_some() {
-                    return Some(nameplate.to_string());
+                .insert(mailbox_id.clone(), ClaimedMailbox::new(client_id));
+            return Some(mailbox_id);
+        } else if !self.mailbox_has_client(&mailbox_id, &client_id) {
+            let claimed_mailbox = self.mailboxes.get_mut(&mailbox_id);
+            if let Some(claimed_mailbox) = claimed_mailbox {
+                if claimed_mailbox.add_client(client_id).is_some() {
+                    return Some(mailbox_id);
                 }
             }
         }
@@ -87,7 +93,7 @@ impl RendezvousServerStateInner {
         })
     }
 
-    pub fn allocate(&mut self, client_id: &EitherSide) -> Option<String> {
+    pub fn allocate(&mut self, client_id: &EitherSide) -> Option<Nameplate> {
         self.cleanup_allocations();
         if self.allocations.len() + self.mailboxes.len() >= MAX_MAILBOXES {
             // Sorry, we are full at the moment
@@ -95,11 +101,16 @@ impl RendezvousServerStateInner {
         }
 
         for key in 1..MAX_MAILBOXES {
-            let key = key.to_string();
-            if !self.mailboxes.contains_key(&key) && !self.allocations.contains_key(&key) {
-                self.allocations
-                    .insert(key.clone(), (client_id.clone(), std::time::Instant::now()));
-                return Some(key);
+            let mailbox_id = Mailbox(key.to_string());
+            let nameplate = Nameplate(key.to_string());
+            if !self.mailboxes.contains_key(&mailbox_id)
+                && !self.allocations.contains_key(&nameplate)
+            {
+                self.allocations.insert(
+                    nameplate.clone(),
+                    (client_id.clone(), std::time::Instant::now()),
+                );
+                return Some(nameplate);
             }
         }
 
@@ -107,7 +118,7 @@ impl RendezvousServerStateInner {
         None
     }
 
-    pub fn nameplate_has_client(&self, nameplate: &str, client_id: &EitherSide) -> bool {
+    pub fn mailbox_has_client(&self, nameplate: &Mailbox, client_id: &EitherSide) -> bool {
         if let Some(mailbox) = self.mailboxes.get(nameplate) {
             mailbox.has_client(client_id)
         } else {
@@ -115,14 +126,14 @@ impl RendezvousServerStateInner {
         }
     }
 
-    pub fn remove_client(&mut self, nameplate: &str, client: &EitherSide) -> bool {
-        println!("Removing client {} from mailbox {}", client, nameplate);
-        let mailbox = self.mailboxes.get_mut(nameplate);
+    pub fn remove_client(&mut self, mailbox_id: &Mailbox, client: &EitherSide) -> bool {
+        println!("Removing client {} from mailbox {}", client, mailbox_id);
+        let mailbox = self.mailboxes.get_mut(mailbox_id);
         if let Some(mailbox) = mailbox {
             let res = mailbox.remove_client(client);
 
             if mailbox.is_empty() {
-                self.mailboxes.remove(nameplate);
+                self.mailboxes.remove(mailbox_id);
             }
 
             res
@@ -131,13 +142,13 @@ impl RendezvousServerStateInner {
         }
     }
 
-    pub(crate) fn mailboxes_mut(&mut self) -> &mut HashMap<String, ClaimedMailbox> {
+    pub(crate) fn mailboxes_mut(&mut self) -> &mut HashMap<Mailbox, ClaimedMailbox> {
         &mut self.mailboxes
     }
 
     pub(crate) fn allocations_mut(
         &mut self,
-    ) -> &mut HashMap<String, (EitherSide, std::time::Instant)> {
+    ) -> &mut HashMap<Nameplate, (EitherSide, std::time::Instant)> {
         &mut self.allocations
     }
 }
@@ -146,9 +157,9 @@ impl RendezvousServerStateInner {
 pub(crate) struct RendezvousServerState(Arc<RwLock<RendezvousServerStateInner>>);
 
 impl RendezvousServerState {
-    pub fn client_is_open(&self, nameplate: &str, client_id: &EitherSide) -> bool {
+    pub fn client_is_open(&self, mailbox_id: &Mailbox, client_id: &EitherSide) -> bool {
         let lock = self.0.read().unwrap();
-        if let Some(mailbox) = lock.mailboxes.get(nameplate) {
+        if let Some(mailbox) = lock.mailboxes.get(mailbox_id) {
             if let Some(client) = mailbox.client(client_id) {
                 return client.is_open();
             }
