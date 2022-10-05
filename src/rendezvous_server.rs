@@ -10,7 +10,7 @@ use async_tungstenite::tungstenite::Error;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::future::err;
 use futures::stream::FusedStream;
-use futures::{select, FutureExt, SinkExt, StreamExt};
+use futures::{select, AsyncReadExt, FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::time::Duration;
@@ -19,16 +19,16 @@ use std::time::Duration;
 pub enum ReceiveError {
     #[error("Error parsing JSON message: {:?}", _0)]
     JsonParse(String),
-    #[error("Received unexpected message type: {}", _0)]
+    #[error("Received unexpected message type: {:?}", _0)]
     UnexpectedType(tungstenite::Message),
-    #[error("WebSocket receive error: {}", source)]
+    #[error("WebSocket error: {}", source)]
     WebSocket {
         #[from]
         #[source]
         source: tungstenite::Error,
     },
     #[error("WebSocket closed")]
-    Closed,
+    Closed(Option<tungstenite::protocol::CloseFrame<'static>>),
 }
 
 pub struct RendezvousServer {
@@ -77,30 +77,38 @@ impl RendezvousServer {
     async fn handle_error(mut ws: &mut WebSocketStream<TcpStream>, error: ClientConnectionError) {
         println!("An error occurred: {}", error);
         println!("Backtrace: {:?}", backtrace::Backtrace::new());
-        Self::send_msg(
-            &mut ws,
-            &ServerMessage::Error {
-                error: error.to_string(),
-                orig: Box::new(ServerMessage::Unknown),
-            },
-        )
-        .await;
+
+        if !ws.is_terminated() {
+            Self::send_msg(
+                &mut ws,
+                &ServerMessage::Error {
+                    error: error.to_string(),
+                    orig: Box::new(ServerMessage::Unknown),
+                },
+            )
+            .await;
+        }
     }
 
     async fn handle_error_close_mailbox(
         mut ws: &mut WebSocketStream<TcpStream>,
         state: RendezvousServerState,
         nameplate: &str,
+        client_id: &str,
         error: ClientConnectionError,
     ) {
         Self::handle_error(ws, error);
-        state
-            .write()
-            .unwrap()
-            .mailboxes_mut()
-            .get_mut(nameplate)
-            .map(|m| m.close_mailbox());
-        state.write().unwrap().mailboxes_mut().remove(nameplate);
+
+        // If the client was closed successfully nothing else to do here
+        if state.client_is_open(nameplate, client_id) {
+            state
+                .write()
+                .unwrap()
+                .mailboxes_mut()
+                .get_mut(nameplate)
+                .map(|m| m.close_mailbox());
+            state.write().unwrap().mailboxes_mut().remove(nameplate);
+        }
     }
 
     async fn receive_msg(
@@ -108,8 +116,8 @@ impl RendezvousServer {
     ) -> Result<ClientMessage, ReceiveError> {
         if let Some(msg) = ws.next().await {
             match msg {
-                Ok(msg) => {
-                    if let tungstenite::Message::Text(msg_txt) = msg {
+                Ok(msg) => match msg {
+                    tungstenite::Message::Text(msg_txt) => {
                         println!("Receive: {}", msg_txt);
                         let client_msg = serde_json::from_str(&msg_txt);
                         if let Ok(client_msg) = client_msg {
@@ -117,14 +125,14 @@ impl RendezvousServer {
                         } else {
                             Err(ReceiveError::JsonParse(msg_txt))
                         }
-                    } else {
-                        Err(ReceiveError::UnexpectedType(msg))
                     }
-                }
+                    tungstenite::Message::Close(frame) => Err(ReceiveError::Closed(frame)),
+                    msg => Err(ReceiveError::UnexpectedType(msg)),
+                },
                 Err(err) => Err(err.into()),
             }
         } else {
-            Err(ReceiveError::Closed)
+            Err(ReceiveError::Closed(None))
         }
     }
 
@@ -326,9 +334,19 @@ impl RendezvousServer {
                             Self::handle_client_msg(&client_id, &client_nameplate, state.clone(), ws, msg).await.unwrap();
                         },
                         Err(err) => {
-                            println!("Message receive error: {}", err);
-                            Self::handle_error_close_mailbox(ws, state.clone(), &client_nameplate, err.into()).await;
-                            break;
+                            match err {
+                                ReceiveError::Closed(close_frame) => {
+                                    // Regular closing of the WebSocket
+                                    println!("WebSocket closed by peer: {}", client_id);
+                                    ws.close(close_frame);
+                                    break;
+                                },
+                                err => {
+                                    println!("Message receive error: {}", err);
+                                    Self::handle_error_close_mailbox(ws, state.clone(), &client_nameplate, &client_id, err.into()).await;
+                                    break;
+                                }
+                            }
                         }
                     }
                 },
@@ -362,13 +380,18 @@ impl RendezvousServer {
                     let ws = async_tungstenite::accept_async(stream).await;
                     if let Ok(mut ws) = ws {
                         Self::ws_handler(state, &mut ws).await.unwrap();
-                        let res = ws.close(None).await;
-                        match res {
-                            Ok(()) => {
-                                println!("Websocket connection terminated");
-                            }
-                            Err(err) => {
-                                println!("Websocket connection error: {}", err);
+
+                        if !ws.is_terminated() {
+                            println!("Closing websocket");
+                            let mut res = ws.close(None).await;
+
+                            match res {
+                                Ok(()) => {}
+                                Err(err) => {
+                                    if !matches!(tungstenite::Error::ConnectionClosed, err) {
+                                        println!("Websocket connection error: {}", err);
+                                    }
+                                }
                             }
                         }
                     }

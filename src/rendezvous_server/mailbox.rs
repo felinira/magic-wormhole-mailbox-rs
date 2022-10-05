@@ -109,6 +109,10 @@ impl ClaimedMailbox {
         &self.clients
     }
 
+    pub fn client(&self, client_id: &str) -> Option<&MailboxClient> {
+        self.clients.iter().find(|client| client.id() == client_id)
+    }
+
     pub fn has_client(&self, client_id: &str) -> bool {
         self.clients
             .iter()

@@ -1,7 +1,7 @@
 use crate::rendezvous_server::mailbox::ClaimedMailbox;
 use derive_more::Deref;
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, RwLock, RwLockWriteGuard};
 use std::time::Duration;
 
 // Limit of max open mailboxes
@@ -144,4 +144,15 @@ impl RendezvousServerStateInner {
 #[derive(Deref, Clone, Default)]
 pub(crate) struct RendezvousServerState(Arc<RwLock<RendezvousServerStateInner>>);
 
-impl RendezvousServerState {}
+impl RendezvousServerState {
+    pub fn client_is_open(&self, nameplate: &str, client_id: &str) -> bool {
+        let lock = self.0.read().unwrap();
+        if let Some(mailbox) = lock.mailboxes.get(nameplate) {
+            if let Some(client) = mailbox.client(client_id) {
+                return client.is_open();
+            }
+        }
+
+        return false;
+    }
+}
