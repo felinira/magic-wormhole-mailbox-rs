@@ -1,11 +1,10 @@
-use crate::core::{EitherSide, Mailbox, MySide, Nameplate, TheirSide};
+use crate::core::{Mailbox, Nameplate};
 use crate::server_messages::*;
 use async_std::net::TcpStream;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::stream::FusedStream;
 use futures::{select, FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::sync::mpsc::channel;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -100,21 +99,6 @@ impl ClaimedMailbox {
         }
     }
 
-    pub fn pair_sender_for(
-        &mut self,
-        client_id: &str,
-    ) -> Option<async_channel::Sender<ServerMessage>> {
-        if let Some(pos) = self
-            .clients
-            .iter()
-            .position(|client| client.id() == client_id)
-        {
-            return Some(self.channels[(pos + 1) % 2].0.clone());
-        }
-
-        None
-    }
-
     pub fn client_receiver_of(
         &mut self,
         client_id: &str,
@@ -158,7 +142,7 @@ impl ClaimedMailbox {
     }
 
     pub fn open(&mut self, client_id: &str) -> bool {
-        for (i, client) in &mut self.clients.iter_mut().enumerate() {
+        for client in &mut self.clients {
             if client.id() == client_id {
                 return client.open();
             }
@@ -180,6 +164,7 @@ struct MailboxServerState {
 
 impl MailboxServerState {
     pub fn try_claim(&mut self, nameplate: &str, client_id: &str) -> Option<String> {
+        self.cleanup_allocations();
         self.cleanup_mailboxes();
 
         if self.mailboxes.len() > MAX_MAILBOXES {
@@ -189,7 +174,7 @@ impl MailboxServerState {
 
         if self.mailboxes.get(nameplate).is_none() {
             // We check allocations if the mailbox is not open yet
-            if let Some((allocated_client_id, time)) = self.allocations.get(nameplate) {
+            if let Some((allocated_client_id, _time)) = self.allocations.get(nameplate) {
                 if client_id != allocated_client_id {
                     // This allocation was not for you
                     return None;
@@ -203,7 +188,7 @@ impl MailboxServerState {
             return Some(nameplate.to_string());
         } else if !self.nameplate_has_client(nameplate, client_id) {
             let mailbox = self.mailboxes.get_mut(nameplate);
-            if let Some(mut mailbox) = mailbox {
+            if let Some(mailbox) = mailbox {
                 if mailbox.add_client(client_id).is_some() {
                     return Some(nameplate.to_string());
                 }
@@ -215,7 +200,7 @@ impl MailboxServerState {
 
     pub fn cleanup_allocations(&mut self) {
         self.allocations
-            .retain(|nameplate, (_client_id, time)| time.elapsed() < Duration::from_secs(60));
+            .retain(|_nameplate, (_client_id, time)| time.elapsed() < Duration::from_secs(60));
     }
 
     pub fn cleanup_mailboxes(&mut self) {
@@ -257,7 +242,7 @@ impl MailboxServerState {
             return None;
         }
 
-        for key in 0..MAX_MAILBOXES {
+        for key in 1..MAX_MAILBOXES {
             let key = key.to_string();
             if !self.mailboxes.contains_key(&key) && !self.allocations.contains_key(&key) {
                 self.allocations.insert(
@@ -283,7 +268,7 @@ impl MailboxServerState {
     pub fn remove_client(&mut self, nameplate: &str, client: &str) -> bool {
         println!("Removing client {} from mailbox {}", client, nameplate);
         let mailbox = self.mailboxes.get_mut(nameplate);
-        if let Some(mut mailbox) = mailbox {
+        if let Some(mailbox) = mailbox {
             let res = mailbox.remove_client(client);
 
             if mailbox.is_empty() {
@@ -293,34 +278,6 @@ impl MailboxServerState {
             res
         } else {
             false
-        }
-    }
-
-    pub fn get_mailbox(&mut self, nameplate: &str) -> Option<&ClaimedMailbox> {
-        self.mailboxes.get(nameplate)
-    }
-
-    pub fn pair_sender_for(
-        &mut self,
-        nameplate: &str,
-        client_id: &str,
-    ) -> Option<async_channel::Sender<ServerMessage>> {
-        if let Some(mailbox) = self.mailboxes.get_mut(nameplate) {
-            mailbox.pair_sender_for(client_id)
-        } else {
-            None
-        }
-    }
-
-    pub fn client_receiver_of(
-        &mut self,
-        nameplate: &str,
-        client_id: &str,
-    ) -> Option<async_channel::Receiver<ServerMessage>> {
-        if let Some(mailbox) = self.mailboxes.get_mut(nameplate) {
-            mailbox.client_receiver_of(client_id)
-        } else {
-            None
         }
     }
 }
@@ -417,7 +374,7 @@ impl MailboxServer {
                     .unwrap()
                     .channels
                     .iter_mut()
-                    .map(|(sender, receiver)| sender.clone())
+                    .map(|(sender, _receiver)| sender.clone())
                     .collect::<Vec<async_channel::Sender<ServerMessage>>>();
 
                 for channel in &mut senders {
@@ -469,7 +426,7 @@ impl MailboxServer {
                 println!("Closed mailbox for client: {}. Mood: {}", client_id, mood);
                 let closed = {
                     let mailboxes = &mut state.lock().unwrap().mailboxes;
-                    if let Some(mailbox) = mailboxes.get_mut(nameplate) {
+                    if let Some(mailbox) = mailboxes.get_mut(&mailbox.0) {
                         mailbox.remove_client(client_id)
                     } else {
                         false
@@ -496,6 +453,7 @@ impl MailboxServer {
         state: Arc<Mutex<MailboxServerState>>,
         mut ws: WebSocketStream<TcpStream>,
     ) -> Result<(), ()> {
+        #[allow(deprecated)]
         let welcome = ServerMessage::Welcome {
             welcome: WelcomeMessage {
                 current_cli_version: None,
@@ -509,6 +467,7 @@ impl MailboxServer {
         let msg = Self::receive_msg(&mut ws).await?;
         let client_id = match msg {
             ClientMessage::Bind { appid, side } => {
+                // TODO: scope by app id
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 (**(side)).to_string()
             }

@@ -1,4 +1,5 @@
 #![deny(unused_must_use)]
+#![allow(unused)]
 
 use crate::zeroconf::{ZeroconfBrowser, ZeroconfService};
 use futures::{select, FutureExt};
@@ -8,11 +9,6 @@ mod mailbox;
 mod network;
 mod server_messages;
 mod zeroconf;
-
-#[derive(Default, Debug)]
-pub struct Context {
-    service_name: String,
-}
 
 #[async_std::main]
 async fn main() {

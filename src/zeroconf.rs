@@ -86,6 +86,8 @@ impl ZeroconfService {
             }
         }
     }
+
+    pub fn stop(&mut self) {}
 }
 
 pub(crate) struct ZeroconfBrowser {
