@@ -1,3 +1,8 @@
+mod mailbox;
+mod state;
+
+use self::mailbox::ClaimedMailbox;
+use self::state::RendezvousServerState;
 use crate::core::{Mailbox, Nameplate};
 use crate::server_messages::*;
 use async_std::net::TcpStream;
@@ -5,289 +10,14 @@ use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::stream::FusedStream;
 use futures::{select, FutureExt, SinkExt, StreamExt};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-// Limit of max open mailboxes
-const MAX_MAILBOXES: usize = 1024;
-
-struct MailboxClient {
-    id: String,
-    is_open: bool,
-    was_closed: bool,
-}
-
-impl MailboxClient {
-    pub fn new(id: &str) -> Self {
-        Self {
-            id: id.to_string(),
-            is_open: false,
-            was_closed: false,
-        }
-    }
-
-    pub fn id(&self) -> &str {
-        &self.id
-    }
-
-    /// Can only open once
-    pub fn open(&mut self) -> bool {
-        if self.is_open {
-            return false;
-        }
-
-        if !self.was_closed {
-            self.is_open = true;
-        }
-
-        self.is_open
-    }
-
-    pub fn close(&mut self) {
-        self.is_open = false;
-        self.was_closed = true;
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.is_open
-    }
-}
-
-struct ClaimedMailbox {
-    clients: Vec<MailboxClient>,
-    channels: Vec<(
-        async_channel::Sender<ServerMessage>,
-        async_channel::Receiver<ServerMessage>,
-    )>,
-    creation_time: std::time::Instant,
-    last_activity: std::time::Instant,
-}
-
-impl ClaimedMailbox {
-    pub fn new(first_client_id: &str) -> Self {
-        let now = std::time::Instant::now();
-        let mut clients = Vec::with_capacity(2);
-        clients.push(MailboxClient::new(first_client_id));
-
-        // pre-create the communication channels to store the messages inside
-        let channels = vec![async_channel::unbounded(), async_channel::unbounded()];
-
-        Self {
-            clients,
-            channels,
-            creation_time: now,
-            last_activity: now,
-        }
-    }
-
-    pub fn add_client(&mut self, client_id: &str) -> Option<&MailboxClient> {
-        if self.is_full() {
-            None
-        } else {
-            let client = MailboxClient::new(client_id);
-            self.clients.push(client);
-            self.clients.get(self.clients.len() - 1)
-        }
-    }
-
-    pub fn remove_client(&mut self, client_id: &str) -> bool {
-        if let Some(pos) = self.clients.iter().position(|c| c.id == client_id) {
-            self.clients.remove(pos);
-            true
-        } else {
-            false
-        }
-    }
-
-    pub fn client_receiver_of(
-        &mut self,
-        client_id: &str,
-    ) -> Option<async_channel::Receiver<ServerMessage>> {
-        if let Some(pos) = self
-            .clients
-            .iter()
-            .position(|client| client.id() == client_id)
-        {
-            Some(self.channels[pos].1.clone())
-        } else {
-            None
-        }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.clients.is_empty()
-    }
-
-    pub fn is_full(&self) -> bool {
-        self.clients.len() >= 2
-    }
-
-    pub fn is_full_open(&self) -> bool {
-        self.is_full() && self.clients.iter().all(|client| client.is_open())
-    }
-
-    pub fn client_count(&self) -> usize {
-        self.clients.len()
-    }
-
-    pub fn clients(&self) -> &[MailboxClient] {
-        &self.clients
-    }
-
-    pub fn has_client(&self, client_id: &str) -> bool {
-        self.clients
-            .iter()
-            .find(|client| client.id() == client_id)
-            .is_some()
-    }
-
-    pub fn open(&mut self, client_id: &str) -> bool {
-        for client in &mut self.clients {
-            if client.id() == client_id {
-                return client.open();
-            }
-        }
-
-        false
-    }
-
-    pub fn close(&mut self) {
-        self.clients.iter_mut().for_each(|client| client.close())
-    }
-}
-
-#[derive(Default)]
-struct MailboxServerState {
-    mailboxes: HashMap<String, ClaimedMailbox>,
-    allocations: HashMap<String, (String, std::time::Instant)>,
-}
-
-impl MailboxServerState {
-    pub fn try_claim(&mut self, nameplate: &str, client_id: &str) -> Option<String> {
-        self.cleanup_allocations();
-        self.cleanup_mailboxes();
-
-        if self.mailboxes.len() > MAX_MAILBOXES {
-            // Sorry, no mailboxes are free at the moment
-            return None;
-        }
-
-        if self.mailboxes.get(nameplate).is_none() {
-            // We check allocations if the mailbox is not open yet
-            if let Some((allocated_client_id, _time)) = self.allocations.get(nameplate) {
-                if client_id != allocated_client_id {
-                    // This allocation was not for you
-                    return None;
-                } else {
-                    self.allocations.remove(nameplate);
-                }
-            }
-
-            self.mailboxes
-                .insert(nameplate.to_string(), ClaimedMailbox::new(client_id));
-            return Some(nameplate.to_string());
-        } else if !self.nameplate_has_client(nameplate, client_id) {
-            let mailbox = self.mailboxes.get_mut(nameplate);
-            if let Some(mailbox) = mailbox {
-                if mailbox.add_client(client_id).is_some() {
-                    return Some(nameplate.to_string());
-                }
-            }
-        }
-
-        None
-    }
-
-    pub fn cleanup_allocations(&mut self) {
-        self.allocations
-            .retain(|_nameplate, (_client_id, time)| time.elapsed() < Duration::from_secs(60));
-    }
-
-    pub fn cleanup_mailboxes(&mut self) {
-        println!("Cleaning up mailboxes");
-        self.mailboxes.retain(|nameplate, mailbox| {
-            if mailbox.is_empty() {
-                println!("Mailbox {} removed", nameplate);
-                return false;
-            }
-
-            // 72 hours after creation in any case
-            let creation_duration = Duration::from_secs(60 * 60 * 72);
-            if mailbox.creation_time.elapsed() > creation_duration {
-                println!("Mailbox {} removed", nameplate);
-                return false;
-            }
-
-            let activity_duration = if mailbox.is_full() {
-                //24 hours after last message
-                Duration::from_secs(60 * 60 * 24)
-            } else {
-                // 2 hours after last activity if mailbox is not full
-                Duration::from_secs(60 * 60 * 2)
-            };
-
-            if mailbox.last_activity.elapsed() > activity_duration {
-                println!("Mailbox {} removed", nameplate);
-                false
-            } else {
-                true
-            }
-        })
-    }
-
-    pub fn allocate(&mut self, client_id: &str) -> Option<String> {
-        self.cleanup_allocations();
-        if self.allocations.len() + self.mailboxes.len() >= MAX_MAILBOXES {
-            // Sorry, we are full at the moment
-            return None;
-        }
-
-        for key in 1..MAX_MAILBOXES {
-            let key = key.to_string();
-            if !self.mailboxes.contains_key(&key) && !self.allocations.contains_key(&key) {
-                self.allocations.insert(
-                    key.clone(),
-                    (client_id.to_string(), std::time::Instant::now()),
-                );
-                return Some(key);
-            }
-        }
-
-        // MAX_ALLOCATIONS reached
-        None
-    }
-
-    pub fn nameplate_has_client(&self, nameplate: &str, client_id: &str) -> bool {
-        if let Some(mailbox) = self.mailboxes.get(nameplate) {
-            mailbox.has_client(client_id)
-        } else {
-            false
-        }
-    }
-
-    pub fn remove_client(&mut self, nameplate: &str, client: &str) -> bool {
-        println!("Removing client {} from mailbox {}", client, nameplate);
-        let mailbox = self.mailboxes.get_mut(nameplate);
-        if let Some(mailbox) = mailbox {
-            let res = mailbox.remove_client(client);
-
-            if mailbox.is_empty() {
-                self.mailboxes.remove(nameplate);
-            }
-
-            res
-        } else {
-            false
-        }
-    }
-}
-
-pub struct MailboxServer {
+pub struct RendezvousServer {
     listener: async_std::net::TcpListener,
-    state: Arc<Mutex<MailboxServerState>>,
+    state: RendezvousServerState,
 }
 
-impl MailboxServer {
+impl RendezvousServer {
     pub async fn new() -> Result<Self, std::io::Error> {
         let addrs: [async_std::net::SocketAddr; 2] =
             ["[::]:0".parse().unwrap(), "0.0.0.0:0".parse().unwrap()];
@@ -312,19 +42,19 @@ impl MailboxServer {
 
     async fn fail_close_mailbox(
         mut ws: &mut WebSocketStream<TcpStream>,
-        state: Arc<Mutex<MailboxServerState>>,
+        state: RendezvousServerState,
         nameplate: &str,
     ) {
         println!("Failure condition");
         println!("Backtrace: {:?}", backtrace::Backtrace::new());
         Self::send_msg(&mut ws, &ServerMessage::Unknown).await;
         state
-            .lock()
+            .write()
             .unwrap()
-            .mailboxes
+            .mailboxes_mut()
             .get_mut(nameplate)
-            .map(|m| m.close());
-        state.lock().unwrap().mailboxes.remove(nameplate);
+            .map(|m| m.close_all());
+        state.write().unwrap().mailboxes_mut().remove(nameplate);
     }
 
     async fn receive_msg(ws: &mut WebSocketStream<TcpStream>) -> Result<ClientMessage, ()> {
@@ -359,55 +89,41 @@ impl MailboxServer {
     async fn handle_client_msg(
         client_id: &str,
         nameplate: &str,
-        state: Arc<Mutex<MailboxServerState>>,
+        state: RendezvousServerState,
         mut ws: &mut WebSocketStream<TcpStream>,
         client_msg: ClientMessage,
     ) -> Result<(), ()> {
         match client_msg {
             ClientMessage::Add { phase, body } => {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
-                let mut senders = state
-                    .lock()
+                let mut broadcast = state
+                    .write()
                     .unwrap()
-                    .mailboxes
+                    .mailboxes_mut()
                     .get_mut(nameplate)
                     .unwrap()
-                    .channels
-                    .iter_mut()
-                    .map(|(sender, _receiver)| sender.clone())
-                    .collect::<Vec<async_channel::Sender<ServerMessage>>>();
+                    .broadcast_sender();
 
-                for channel in &mut senders {
-                    // send the message to the peer channel
-                    channel
-                        .send(ServerMessage::Message(EncryptedMessage {
-                            side: client_id.into(),
-                            phase: phase.clone(),
-                            body: body.clone(),
-                        }))
-                        .await
-                        .unwrap();
-                }
+                // send the message to the broadcast channel
+                broadcast
+                    .send(ServerMessage::Message(EncryptedMessage {
+                        side: client_id.into(),
+                        phase: phase.clone(),
+                        body: body.clone(),
+                    }))
+                    .await
+                    .unwrap();
 
-                if senders.len() == 0 {
-                    Self::fail_close_mailbox(&mut ws, state.clone(), nameplate).await;
-                    Err(())
-                } else {
-                    Ok(())
-                }
+                Ok(())
             }
             ClientMessage::Release { nameplate } => {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 let released = {
-                    let mailboxes = &mut state.lock().unwrap().mailboxes;
                     let mut released = false;
-                    if let Some(mailbox) = mailboxes.get_mut(&nameplate) {
-                        for client in &mut mailbox.clients {
-                            if client_id == client.id() {
-                                client.close();
-                                released = true;
-                            }
-                        }
+                    if let Some(mailbox) =
+                        state.write().unwrap().mailboxes_mut().get_mut(&nameplate)
+                    {
+                        released = mailbox.close_client(client_id)
                     }
 
                     released
@@ -425,8 +141,9 @@ impl MailboxServer {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 println!("Closed mailbox for client: {}. Mood: {}", client_id, mood);
                 let closed = {
-                    let mailboxes = &mut state.lock().unwrap().mailboxes;
-                    if let Some(mailbox) = mailboxes.get_mut(&mailbox.0) {
+                    if let Some(mailbox) =
+                        state.write().unwrap().mailboxes_mut().get_mut(&mailbox.0)
+                    {
                         mailbox.remove_client(client_id)
                     } else {
                         false
@@ -450,7 +167,7 @@ impl MailboxServer {
     }
 
     async fn ws_handler(
-        state: Arc<Mutex<MailboxServerState>>,
+        state: RendezvousServerState,
         mut ws: WebSocketStream<TcpStream>,
     ) -> Result<(), ()> {
         #[allow(deprecated)]
@@ -485,7 +202,7 @@ impl MailboxServer {
             let msg = Self::receive_msg(&mut ws).await?;
             match &msg {
                 ClientMessage::Allocate => {
-                    let allocation = state.lock().unwrap().allocate(&client_id);
+                    let allocation = state.write().unwrap().allocate(&client_id);
 
                     if let Some(allocation) = allocation {
                         Self::send_msg(&mut ws, &ServerMessage::Ack).await;
@@ -506,7 +223,7 @@ impl MailboxServer {
                     println!("Claiming nameplate: {}", nameplate);
 
                     if state
-                        .lock()
+                        .write()
                         .unwrap()
                         .try_claim(&nameplate, &client_id)
                         .is_none()
@@ -545,14 +262,14 @@ impl MailboxServer {
         match msg {
             ClientMessage::Open { mailbox } => {
                 if state
-                    .lock()
+                    .read()
                     .unwrap()
                     .nameplate_has_client(&mailbox.0, &client_id)
                 {
                     let opened = state
-                        .lock()
+                        .write()
                         .unwrap()
-                        .mailboxes
+                        .mailboxes_mut()
                         .get_mut(&mailbox.0)
                         .unwrap()
                         .open(&client_id);
@@ -573,19 +290,18 @@ impl MailboxServer {
             }
         }
 
-        let client_receiver = state
-            .lock()
+        let broadcast_receiver = state
+            .write()
             .unwrap()
-            .mailboxes
+            .mailboxes_mut()
             .get_mut(&client_nameplate)
             .unwrap()
-            .client_receiver_of(&client_id)
-            .unwrap();
+            .broadcast_receiver();
 
         // Now we are operating on the open channel
         while !ws.is_terminated() {
             let mut client_future = Box::pin(Self::receive_msg(&mut ws)).fuse();
-            let mut peer_future = Box::pin(client_receiver.recv()).fuse();
+            let mut broadcast_future = Box::pin(broadcast_receiver.recv()).fuse();
 
             select! {
                 msg = client_future => {
@@ -597,7 +313,7 @@ impl MailboxServer {
                         break;
                     }
                 },
-                msg = peer_future => {
+                msg = broadcast_future => {
                     drop(client_future);
                     if let Ok(msg) = msg {
                         println!("Sending msg: {} to peer {}", msg, client_id);

@@ -22,7 +22,7 @@ pub enum Mood {
  *
  * There are multiple different protocols built on top of the core
  * Wormhole protocol. They are identified by a unique URI-like ID string
- * (`AppID`), an URL to find the rendezvous server (might be shared among
+ * (`AppID`), an URL to find the rendezvous_server server (might be shared among
  * multiple protocols), and client implementations also have a "version"
  * data to do protocol negotiation.
  *
@@ -58,7 +58,7 @@ impl<V: serde::Serialize> AppConfig<V> {
 ///
 /// The application ID is a string that scopes all commands
 /// to that name, effectively separating different protocols
-/// on the same rendezvous server.
+/// on the same rendezvous_server server.
 #[derive(
     PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display, derive_more::Deref,
 )]

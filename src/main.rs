@@ -5,14 +5,14 @@ use crate::zeroconf::{ZeroconfBrowser, ZeroconfService};
 use futures::{select, FutureExt};
 
 mod core;
-mod mailbox;
 mod network;
+mod rendezvous_server;
 mod server_messages;
 mod zeroconf;
 
 #[async_std::main]
 async fn main() {
-    let mut mailbox = mailbox::MailboxServer::new().await.unwrap();
+    let mut mailbox = rendezvous_server::RendezvousServer::new().await.unwrap();
     println!("Listening with mailbox port: {}", mailbox.port());
 
     let service = ZeroconfService::run(mailbox.port());
