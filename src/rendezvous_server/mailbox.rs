@@ -122,6 +122,12 @@ impl ClaimedMailbox {
         self.clients.iter().find(|client| client.id() == client_id)
     }
 
+    pub fn client_mut(&mut self, client_id: &EitherSide) -> Option<&mut MailboxClient> {
+        self.clients
+            .iter_mut()
+            .find(|client| client.id() == client_id)
+    }
+
     pub fn has_client(&self, client_id: &EitherSide) -> bool {
         self.clients
             .iter()
@@ -173,5 +179,9 @@ impl ClaimedMailbox {
 
     pub fn last_activity(&self) -> &std::time::Instant {
         &self.last_activity
+    }
+
+    pub fn update_last_activity(&mut self) {
+        self.last_activity = std::time::Instant::now();
     }
 }

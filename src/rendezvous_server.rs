@@ -11,9 +11,14 @@ use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::future::err;
 use futures::stream::FusedStream;
 use futures::{select, AsyncReadExt, FutureExt, SinkExt, StreamExt};
+use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::sync::Arc;
 use std::time::Duration;
+
+// How often should mailboxes be cleaned up?
+const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, thiserror::Error)]
 pub enum ReceiveError {
@@ -29,11 +34,6 @@ pub enum ReceiveError {
     },
     #[error("WebSocket closed")]
     Closed(Option<tungstenite::protocol::CloseFrame<'static>>),
-}
-
-pub struct RendezvousServer {
-    listener: async_std::net::TcpListener,
-    state: RendezvousServerState,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -54,17 +54,44 @@ pub enum ClientConnectionError {
     Inconsistency,
 }
 
+pub struct RendezvousServer {
+    listener: async_std::net::TcpListener,
+    state: RendezvousServerState,
+    cleanup_task: async_std::task::JoinHandle<()>,
+}
+
 impl RendezvousServer {
-    pub async fn new(port: u16) -> Result<Self, std::io::Error> {
+    pub async fn run(port: u16) -> Result<Self, std::io::Error> {
         let addrs: [async_std::net::SocketAddr; 2] = [
             format!("[::]:{}", port).parse().unwrap(),
             format!("0.0.0.0:{}", port).parse().unwrap(),
         ];
+
         let listener = async_std::net::TcpListener::bind(&addrs[..]).await?;
+        let state = RendezvousServerState::default();
+
+        let state_clone = state.clone();
+        let cleanup_task = async_std::task::spawn(async move {
+            let mut timer = async_io::Timer::interval(CLEANUP_INTERVAL);
+            loop {
+                timer.next().await;
+                state_clone.write().cleanup_allocations();
+                state_clone.write().cleanup_mailboxes();
+            }
+        });
+
         Ok(Self {
             listener,
-            state: Default::default(),
+            state,
+            cleanup_task,
         })
+    }
+
+    pub async fn stop(self) {
+        // Cancel the regular cleanup timer
+        self.cleanup_task.cancel();
+
+        // Drops the TCP listener, which will close the connection
     }
 
     #[must_use]
@@ -90,7 +117,7 @@ impl RendezvousServer {
         }
     }
 
-    async fn handle_error_close_mailbox(
+    async fn handle_error_release(
         mut ws: &mut WebSocketStream<TcpStream>,
         state: RendezvousServerState,
         mailbox_id: &Mailbox,
@@ -99,16 +126,10 @@ impl RendezvousServer {
     ) {
         Self::handle_error(ws, error);
 
-        // If the client was closed successfully nothing else to do here
-        if state.read().mailbox(mailbox_id).map_or(false, |m| {
-            m.client(client_id).map_or(false, |c| c.is_open())
-        }) {
-            state
-                .write()
-                .mailbox_mut(mailbox_id)
-                .map(|m| m.close_mailbox());
-            state.write().mailboxes_mut().remove(mailbox_id);
-        }
+        state
+            .write()
+            .mailbox_mut(mailbox_id)
+            .map(|m| m.client_mut(client_id).map(|c| c.release()));
     }
 
     async fn receive_msg(
@@ -149,8 +170,7 @@ impl RendezvousServer {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 let mut broadcast = state
                     .write()
-                    .mailboxes_mut()
-                    .get_mut(mailbox_id.into())
+                    .mailbox_mut(mailbox_id)
                     .unwrap()
                     .broadcast_sender();
 
@@ -163,6 +183,13 @@ impl RendezvousServer {
                     })
                     .await
                     .unwrap();
+
+                // update last activity timestamp
+                state
+                    .write()
+                    .mailbox_mut(mailbox_id)
+                    .unwrap()
+                    .update_last_activity();
 
                 Ok(())
             }
@@ -341,7 +368,7 @@ impl RendezvousServer {
                                 },
                                 err => {
                                     println!("Message receive error: {}", err);
-                                    Self::handle_error_close_mailbox(ws, state.clone(), &client_mailbox, &client_id, err.into()).await;
+                                    Self::handle_error_release(ws, state.clone(), &client_mailbox, &client_id, err.into()).await;
                                     break;
                                 }
                             }

@@ -19,9 +19,6 @@ pub(crate) struct RendezvousServerStateInner {
 
 impl RendezvousServerStateInner {
     pub fn try_claim(&mut self, nameplate: &Nameplate, client_id: EitherSide) -> Option<Mailbox> {
-        self.cleanup_allocations();
-        self.cleanup_mailboxes();
-
         if self.mailboxes.len() > MAX_MAILBOXES {
             // Sorry, no mailboxes are free at the moment
             return None;
@@ -93,7 +90,6 @@ impl RendezvousServerStateInner {
     }
 
     pub fn allocate(&mut self, client_id: &EitherSide) -> Option<Nameplate> {
-        self.cleanup_allocations();
         if self.allocations.len() + self.mailboxes.len() >= MAX_MAILBOXES {
             // Sorry, we are full at the moment
             return None;
