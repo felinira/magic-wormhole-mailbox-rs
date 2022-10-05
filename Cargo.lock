@@ -262,6 +262,7 @@ dependencies = [
  "hex",
  "magic-wormhole",
  "once_cell",
+ "parking_lot",
  "rand",
  "serde",
  "serde_derive",

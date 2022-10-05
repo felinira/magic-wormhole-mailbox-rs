@@ -7,7 +7,7 @@ pub type BroadcastReceiver = async_broadcast::Receiver<EncryptedMessage>;
 pub(crate) struct MailboxClient {
     id: EitherSide,
     is_open: bool,
-    was_closed: bool,
+    was_released: bool,
 }
 
 impl MailboxClient {
@@ -15,7 +15,7 @@ impl MailboxClient {
         Self {
             id,
             is_open: false,
-            was_closed: false,
+            was_released: false,
         }
     }
 
@@ -29,20 +29,24 @@ impl MailboxClient {
             return false;
         }
 
-        if !self.was_closed {
+        if !self.was_released {
             self.is_open = true;
         }
 
         self.is_open
     }
 
-    pub fn close(&mut self) {
+    pub fn release(&mut self) {
         self.is_open = false;
-        self.was_closed = true;
+        self.was_released = true;
     }
 
     pub fn is_open(&self) -> bool {
         self.is_open
+    }
+
+    pub fn should_cleanup(&self) -> bool {
+        self.was_released
     }
 }
 
@@ -102,6 +106,10 @@ impl ClaimedMailbox {
         self.is_full() && self.clients.iter().all(|client| client.is_open())
     }
 
+    pub fn should_cleanup(&self) -> bool {
+        self.is_empty() || self.clients.iter().all(|c| !c.is_open())
+    }
+
     pub fn client_count(&self) -> usize {
         self.clients.len()
     }
@@ -121,7 +129,7 @@ impl ClaimedMailbox {
             .is_some()
     }
 
-    pub fn open(&mut self, client_id: &EitherSide) -> bool {
+    pub fn open_client(&mut self, client_id: &EitherSide) -> bool {
         for client in &mut self.clients {
             if client.id() == client_id {
                 return client.open();
@@ -131,21 +139,21 @@ impl ClaimedMailbox {
         false
     }
 
-    pub async fn close_mailbox(&mut self) {
-        self.clients.iter_mut().for_each(|client| client.close());
-        self.broadcast_receiver.close();
-        self.broadcast_sender.close();
-    }
-
-    pub fn close_client(&mut self, client_id: &EitherSide) -> bool {
+    pub fn release_client(&mut self, client_id: &EitherSide) -> bool {
         for client in &mut self.clients {
             if client_id == client.id() {
-                client.close();
+                client.release();
                 return true;
             }
         }
 
         return false;
+    }
+
+    pub async fn close_mailbox(&mut self) {
+        self.clients.iter_mut().for_each(|client| client.release());
+        self.broadcast_receiver.close();
+        self.broadcast_sender.close();
     }
 
     /// This will clone the receiver that is stored in this mailbox.

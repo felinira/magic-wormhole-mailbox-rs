@@ -100,14 +100,14 @@ impl RendezvousServer {
         Self::handle_error(ws, error);
 
         // If the client was closed successfully nothing else to do here
-        if state.client_is_open(mailbox_id, client_id) {
+        if state.read().mailbox(mailbox_id).map_or(false, |m| {
+            m.client(client_id).map_or(false, |c| c.is_open())
+        }) {
             state
                 .write()
-                .unwrap()
-                .mailboxes_mut()
-                .get_mut(mailbox_id)
+                .mailbox_mut(mailbox_id)
                 .map(|m| m.close_mailbox());
-            state.write().unwrap().mailboxes_mut().remove(mailbox_id);
+            state.write().mailboxes_mut().remove(mailbox_id);
         }
     }
 
@@ -149,7 +149,6 @@ impl RendezvousServer {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 let mut broadcast = state
                     .write()
-                    .unwrap()
                     .mailboxes_mut()
                     .get_mut(mailbox_id.into())
                     .unwrap()
@@ -173,11 +172,10 @@ impl RendezvousServer {
                     let mut released = false;
                     if let Some(mailbox) = state
                         .write()
-                        .unwrap()
                         .mailboxes_mut()
                         .get_mut(&Mailbox(nameplate.clone()))
                     {
-                        released = mailbox.close_client(client_id)
+                        released = mailbox.release_client(client_id)
                     }
 
                     released
@@ -196,8 +194,7 @@ impl RendezvousServer {
                 Self::send_msg(&mut ws, &ServerMessage::Ack).await;
                 println!("Closed mailbox for client: {}. Mood: {}", client_id, mood);
                 let closed = {
-                    if let Some(mailbox) = state.write().unwrap().mailboxes_mut().get_mut(&mailbox)
-                    {
+                    if let Some(mailbox) = state.write().mailboxes_mut().get_mut(&mailbox) {
                         mailbox.remove_client(client_id)
                     } else {
                         false
@@ -250,7 +247,7 @@ impl RendezvousServer {
             let msg = Self::receive_msg(ws).await?;
             match &msg {
                 ClientMessage::Allocate => {
-                    let allocation = state.write().unwrap().allocate(&client_id);
+                    let allocation = state.write().allocate(&client_id);
 
                     if let Some(allocation) = allocation {
                         Self::send_msg(ws, &ServerMessage::Ack).await;
@@ -271,7 +268,6 @@ impl RendezvousServer {
 
                     if state
                         .write()
-                        .unwrap()
                         .try_claim(&Nameplate(nameplate.to_string()), client_id.clone())
                         .is_none()
                     {
@@ -301,11 +297,10 @@ impl RendezvousServer {
             ClientMessage::Open { mailbox } => {
                 let opened = state
                     .write()
-                    .unwrap()
                     .mailboxes_mut()
                     .get_mut(&mailbox)
                     .unwrap()
-                    .open(&client_id);
+                    .open_client(&client_id);
                 if opened {
                     Self::send_msg(ws, &ServerMessage::Ack).await;
                 } else {
@@ -319,7 +314,6 @@ impl RendezvousServer {
 
         let mut broadcast_receiver = state
             .write()
-            .unwrap()
             .mailboxes_mut()
             .get_mut(&client_mailbox)
             .unwrap()

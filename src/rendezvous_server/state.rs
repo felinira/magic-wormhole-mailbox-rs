@@ -1,25 +1,24 @@
 use crate::core::{EitherSide, Mailbox, Nameplate};
-use crate::rendezvous_server::mailbox::ClaimedMailbox;
+use crate::rendezvous_server::mailbox::{ClaimedMailbox, MailboxClient};
 use derive_more::Deref;
+use parking_lot::{
+    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
+};
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock, RwLockWriteGuard};
+use std::sync::Arc;
 use std::time::Duration;
 
 // Limit of max open mailboxes
 const MAX_MAILBOXES: usize = 1024;
 
 #[derive(Default)]
-pub struct RendezvousServerStateInner {
+pub(crate) struct RendezvousServerStateInner {
     mailboxes: HashMap<Mailbox, ClaimedMailbox>,
     allocations: HashMap<Nameplate, (EitherSide, std::time::Instant)>,
 }
 
 impl RendezvousServerStateInner {
-    pub(crate) fn try_claim(
-        &mut self,
-        nameplate: &Nameplate,
-        client_id: EitherSide,
-    ) -> Option<Mailbox> {
+    pub fn try_claim(&mut self, nameplate: &Nameplate, client_id: EitherSide) -> Option<Mailbox> {
         self.cleanup_allocations();
         self.cleanup_mailboxes();
 
@@ -64,7 +63,7 @@ impl RendezvousServerStateInner {
     pub fn cleanup_mailboxes(&mut self) {
         println!("Cleaning up mailboxes");
         self.mailboxes.retain(|nameplate, mailbox| {
-            if mailbox.is_empty() {
+            if mailbox.should_cleanup() {
                 println!("Mailbox {} removed", nameplate);
                 return false;
             }
@@ -142,13 +141,19 @@ impl RendezvousServerStateInner {
         }
     }
 
-    pub(crate) fn mailboxes_mut(&mut self) -> &mut HashMap<Mailbox, ClaimedMailbox> {
+    pub fn mailboxes_mut(&mut self) -> &mut HashMap<Mailbox, ClaimedMailbox> {
         &mut self.mailboxes
     }
 
-    pub(crate) fn allocations_mut(
-        &mut self,
-    ) -> &mut HashMap<Nameplate, (EitherSide, std::time::Instant)> {
+    pub fn mailbox(&self, mailbox_id: &Mailbox) -> Option<&ClaimedMailbox> {
+        self.mailboxes.get(mailbox_id)
+    }
+
+    pub fn mailbox_mut(&mut self, mailbox_id: &Mailbox) -> Option<&mut ClaimedMailbox> {
+        self.mailboxes.get_mut(mailbox_id)
+    }
+
+    pub fn allocations_mut(&mut self) -> &mut HashMap<Nameplate, (EitherSide, std::time::Instant)> {
         &mut self.allocations
     }
 }
@@ -156,15 +161,4 @@ impl RendezvousServerStateInner {
 #[derive(Deref, Clone, Default)]
 pub(crate) struct RendezvousServerState(Arc<RwLock<RendezvousServerStateInner>>);
 
-impl RendezvousServerState {
-    pub fn client_is_open(&self, mailbox_id: &Mailbox, client_id: &EitherSide) -> bool {
-        let lock = self.0.read().unwrap();
-        if let Some(mailbox) = lock.mailboxes.get(mailbox_id) {
-            if let Some(client) = mailbox.client(client_id) {
-                return client.is_open();
-            }
-        }
-
-        return false;
-    }
-}
+impl RendezvousServerState {}
