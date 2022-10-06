@@ -10,11 +10,13 @@ use async_tungstenite::tungstenite::Error;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::future::err;
 use futures::stream::FusedStream;
-use futures::{select, AsyncReadExt, FutureExt, SinkExt, StreamExt};
+use futures::{pending, poll, select, AsyncReadExt, FutureExt, SinkExt, StreamExt};
+use magic_wormhole::AppID;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
 
 // How often should mailboxes be cleaned up?
@@ -43,6 +45,12 @@ pub enum ClientConnectionError {
         #[from]
         #[source]
         source: ReceiveError,
+    },
+    #[error("SendError: {}", source)]
+    Send {
+        #[from]
+        #[source]
+        source: tungstenite::Error,
     },
     #[error("Received unexpected message: {}", _0)]
     UnexpectedMessage(ClientMessage),
@@ -103,8 +111,11 @@ impl RendezvousServer {
                 async_std::task::spawn(async move {
                     let ws = async_tungstenite::accept_async(stream).await;
                     if let Ok(mut ws) = ws {
-                        let mut connection = RendezvousServerConnection::new(state, &mut ws);
-                        connection.handle_connection().await;
+                        let mut connection =
+                            RendezvousServerConnection::init_connection(state, &mut ws).await;
+                        if let Ok(mut connection) = connection {
+                            connection.handle_connection().await;
+                        }
 
                         if !ws.is_terminated() {
                             println!("Closing websocket");
@@ -134,35 +145,20 @@ pub struct RendezvousServerConnection<'a> {
     state: RendezvousServerState,
     websocket: &'a mut WebSocketStream<TcpStream>,
 
-    app: Option<String>,
-    side: Option<EitherSide>,
-
-    did_allocate: bool,
-    did_claim: bool,
-    nameplate_id: Option<Nameplate>,
-    mailbox_id: Option<Mailbox>,
+    app: AppID,
+    side: EitherSide,
+    mailbox_id: Mailbox,
+    broadcast_receiver: async_broadcast::Receiver<EncryptedMessage>,
 
     did_release: bool,
     did_open: bool,
 }
 
 impl<'a> RendezvousServerConnection<'a> {
-    fn new(state: RendezvousServerState, websocket: &'a mut WebSocketStream<TcpStream>) -> Self {
-        Self {
-            state,
-            websocket,
-            app: None,
-            side: None,
-            did_allocate: false,
-            did_claim: false,
-            nameplate_id: None,
-            mailbox_id: None,
-            did_release: false,
-            did_open: false,
-        }
-    }
-
-    async fn handle_connection(&mut self) -> Result<(), ClientConnectionError> {
+    async fn init_connection(
+        state: RendezvousServerState,
+        websocket: &'a mut WebSocketStream<TcpStream>,
+    ) -> Result<RendezvousServerConnection<'a>, ClientConnectionError> {
         #[allow(deprecated)]
         let welcome = ServerMessage::Welcome {
             welcome: WelcomeMessage {
@@ -173,37 +169,34 @@ impl<'a> RendezvousServerConnection<'a> {
             },
         };
 
-        self.send_msg(&welcome).await;
+        Self::send_msg_ws(websocket, &welcome).await?;
 
-        let msg = self.receive_msg().await?;
-        let client_id: EitherSide = match msg {
-            ClientMessage::Bind { appid, side } => {
-                self.side = Some(EitherSide(side.0.clone()));
-                self.app = Some(appid.to_string());
-
-                // TODO: scope by app id
-                EitherSide(side.0.clone())
-            }
+        let msg = Self::receive_msg_ws(websocket).await?;
+        let (app, side) = match msg {
+            ClientMessage::Bind { appid, side } => (appid, EitherSide(side.0.clone())),
             _ => {
                 return Err(ClientConnectionError::UnexpectedMessage(msg));
             }
         };
 
         let mut claimed = false;
-        let mut client_mailbox = Mailbox(String::new());
+        let mut mailbox_id = Mailbox(String::new());
 
         while !claimed {
             // Allocate or claim are the only two messages that can come now
-            let msg = self.receive_msg().await?;
+            let msg = Self::receive_msg_ws(websocket).await?;
             match &msg {
                 ClientMessage::Allocate => {
-                    let allocation = self.state.write().allocate(&client_id);
+                    let allocation = state.write().allocate(&side);
 
                     if let Some(allocation) = allocation {
-                        self.send_msg(&ServerMessage::Allocated {
-                            nameplate: Nameplate::new(&allocation),
-                        })
-                        .await;
+                        Self::send_msg_ws(
+                            websocket,
+                            &ServerMessage::Allocated {
+                                nameplate: Nameplate::new(&allocation),
+                            },
+                        )
+                        .await?;
                     } else {
                         return Err(ClientConnectionError::UnexpectedMessage(msg));
                     }
@@ -211,21 +204,22 @@ impl<'a> RendezvousServerConnection<'a> {
                 ClientMessage::Claim { nameplate } => {
                     println!("Claiming nameplate: {}", nameplate);
 
-                    if self
-                        .state
+                    if state
                         .write()
-                        .try_claim(&Nameplate(nameplate.to_string()), client_id.clone())
+                        .try_claim(&Nameplate(nameplate.to_string()), side.clone())
                         .is_none()
                     {
                         return Err(ClientConnectionError::TooManyClients);
                     } else {
-                        self.send_msg(&ServerMessage::Claimed {
-                            mailbox: Mailbox(nameplate.to_string()),
-                        })
-                        .await;
+                        Self::send_msg_ws(
+                            websocket,
+                            &ServerMessage::Claimed {
+                                mailbox: Mailbox(nameplate.to_string()),
+                            },
+                        )
+                        .await?;
                         claimed = true;
-                        client_mailbox = Mailbox(nameplate.to_string());
-                        self.mailbox_id = Some(client_mailbox);
+                        mailbox_id = Mailbox(nameplate.to_string());
                     }
                 }
                 _ => {
@@ -234,20 +228,19 @@ impl<'a> RendezvousServerConnection<'a> {
             };
         }
 
-        // Now we wait for an open message
-        let msg = self.receive_msg().await?;
-
-        match msg {
+        let msg = Self::receive_msg_ws(websocket).await?;
+        match &msg {
             ClientMessage::Open { mailbox } => {
-                let opened = self
-                    .state
+                let opened = state
                     .write()
                     .mailboxes_mut()
                     .get_mut(&mailbox)
                     .unwrap()
-                    .open_client(&client_id);
+                    .open_client(&side);
                 if !opened {
-                    return Err(ClientConnectionError::NotConnectedToMailbox(mailbox));
+                    return Err(ClientConnectionError::NotConnectedToMailbox(
+                        mailbox.clone(),
+                    ));
                 }
             }
             _ => {
@@ -255,33 +248,42 @@ impl<'a> RendezvousServerConnection<'a> {
             }
         }
 
-        let mut broadcast_receiver = self
-            .state
+        let broadcast_receiver = state
             .write()
-            .mailbox_mut(self.mailbox_id.as_ref().unwrap())
+            .mailbox_mut(&mailbox_id)
             .unwrap()
             .new_broadcast_receiver();
 
+        Ok(Self {
+            state,
+            websocket,
+            app,
+            side,
+            mailbox_id,
+            broadcast_receiver,
+
+            did_release: false,
+            did_open: false,
+        })
+    }
+
+    pub async fn handle_connection(&mut self) -> Result<(), ClientConnectionError> {
         // Now we are operating on the open channel
         while !self.websocket.is_terminated() {
-            let mut client_future = Box::pin(self.receive_msg()).fuse();
-            let mut broadcast_future = Box::pin(broadcast_receiver.recv()).fuse();
-
             select! {
-                msg_res = client_future => {
-                    drop(client_future);
+                msg_res = Self::receive_msg_ws(self.websocket).fuse() => {
                     match msg_res {
                         Ok(msg) => {
                             self.handle_client_msg(msg).await.unwrap();
-                        },
+                        }
                         Err(err) => {
                             match err {
                                 ReceiveError::Closed(close_frame) => {
                                     // Regular closing of the WebSocket
-                                    println!("WebSocket closed by peer: {}", client_id);
-                                    self.websocket.close(close_frame);
+                                    println!("WebSocket closed by peer: {}", self.side);
+                                    self.websocket.close(close_frame).await;
                                     break;
-                                },
+                                }
                                 err => {
                                     println!("Message receive error: {}", err);
                                     self.handle_error_release(err.into()).await;
@@ -291,16 +293,16 @@ impl<'a> RendezvousServerConnection<'a> {
                         }
                     }
                 },
-                msg_res = broadcast_future => {
-                    drop(client_future);
+                msg_res = self.broadcast_receiver.recv().fuse() => {
                     match msg_res {
                         Ok(msg) => {
-                            println!("Sending msg: {} to peer {}", msg, client_id);
-                            self.send_msg(&ServerMessage::Message(msg)).await;
-                        },
+                            println!("Sending msg: {} to peer {}", msg, self.side);
+                            self.send_msg(&ServerMessage::Message(msg)).await?;
+                        }
                         Err(err) => {
                             println!("Message Broadcast error: {}", err);
-                            self.handle_error(ClientConnectionError::Inconsistency).await;
+                            self.handle_error(ClientConnectionError::Inconsistency)
+                                .await;
                             break;
                         }
                     }
@@ -311,10 +313,17 @@ impl<'a> RendezvousServerConnection<'a> {
         Ok(())
     }
 
-    async fn send_msg(&mut self, msg: &ServerMessage) {
+    async fn send_msg_ws(
+        websocket: &mut WebSocketStream<TcpStream>,
+        msg: &ServerMessage,
+    ) -> Result<(), tungstenite::Error> {
         let json = serde_json::to_string(msg).unwrap();
         println!("Send: {}", json);
-        self.websocket.send(json.into()).await.unwrap();
+        websocket.send(json.into()).await
+    }
+
+    async fn send_msg(&mut self, msg: &ServerMessage) -> Result<(), tungstenite::Error> {
+        Self::send_msg_ws(&mut self.websocket, msg).await
     }
 
     async fn handle_error(&mut self, error: ClientConnectionError) {
@@ -333,25 +342,37 @@ impl<'a> RendezvousServerConnection<'a> {
     async fn handle_error_release(&mut self, error: ClientConnectionError) {
         self.handle_error(error);
 
-        if let Some(mailbox_id) = &self.mailbox_id {
-            if let Some(client_id) = &self.side {
-                self.state
-                    .write()
-                    .mailbox_mut(mailbox_id)
-                    .map(|m| m.client_mut(client_id).map(|c| c.release()));
-            }
-        }
+        self.state
+            .write()
+            .mailbox_mut(&self.mailbox_id)
+            .map(|m| m.client_mut(&self.side).map(|c| c.release()));
     }
 
-    async fn receive_msg(&mut self) -> Result<ClientMessage, ReceiveError> {
-        if let Some(msg) = self.websocket.next().await {
-            match msg {
+    #[must_use]
+    async fn receive_msg_ws(
+        websocket: &mut WebSocketStream<TcpStream>,
+    ) -> Result<ClientMessage, ReceiveError> {
+        while let Some(msg) = websocket.next().await {
+            return match msg {
                 Ok(msg) => match msg {
                     tungstenite::Message::Text(msg_txt) => {
                         println!("Receive: {}", msg_txt);
                         let client_msg = serde_json::from_str(&msg_txt);
                         if let Ok(client_msg) = client_msg {
-                            self.send_msg(&ServerMessage::Ack).await;
+                            Self::send_msg_ws(websocket, &ServerMessage::Ack).await?;
+
+                            match client_msg {
+                                ClientMessage::Ping { ping } => {
+                                    Self::send_msg_ws(
+                                        websocket,
+                                        &ServerMessage::Pong { pong: ping },
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                _ => {}
+                            }
+
                             Ok(client_msg)
                         } else {
                             Err(ReceiveError::JsonParse(msg_txt))
@@ -361,10 +382,15 @@ impl<'a> RendezvousServerConnection<'a> {
                     msg => Err(ReceiveError::UnexpectedType(msg)),
                 },
                 Err(err) => Err(err.into()),
-            }
-        } else {
-            Err(ReceiveError::Closed(None))
+            };
         }
+
+        Err(ReceiveError::Closed(None))
+    }
+
+    #[must_use]
+    async fn receive_msg(&mut self) -> Result<ClientMessage, ReceiveError> {
+        Self::receive_msg_ws(self.websocket).await
     }
 
     #[must_use]
@@ -374,35 +400,31 @@ impl<'a> RendezvousServerConnection<'a> {
     ) -> Result<(), ClientConnectionError> {
         match client_msg {
             ClientMessage::Add { phase, body } => {
-                if let Some(mailbox_id) = &self.mailbox_id {
-                    let mut broadcast = self
-                        .state
-                        .write()
-                        .mailbox_mut(mailbox_id)
-                        .unwrap()
-                        .broadcast_sender();
+                let mut broadcast = self
+                    .state
+                    .write()
+                    .mailbox_mut(&self.mailbox_id)
+                    .unwrap()
+                    .broadcast_sender();
 
-                    // send the message to the broadcast channel
-                    broadcast
-                        .broadcast(EncryptedMessage {
-                            side: self.side.as_ref().unwrap().clone().0.into(),
-                            phase: phase.clone(),
-                            body: body.clone(),
-                        })
-                        .await
-                        .unwrap();
+                // send the message to the broadcast channel
+                broadcast
+                    .broadcast(EncryptedMessage {
+                        side: self.side.clone().0.into(),
+                        phase: phase.clone(),
+                        body: body.clone(),
+                    })
+                    .await
+                    .unwrap();
 
-                    // update last activity timestamp
-                    self.state
-                        .write()
-                        .mailbox_mut(mailbox_id)
-                        .unwrap()
-                        .update_last_activity();
+                // update last activity timestamp
+                self.state
+                    .write()
+                    .mailbox_mut(&self.mailbox_id)
+                    .unwrap()
+                    .update_last_activity();
 
-                    Ok(())
-                } else {
-                    Err(ClientConnectionError::Inconsistency)
-                }
+                Ok(())
             }
             ClientMessage::Release { nameplate } => {
                 let released = {
@@ -413,14 +435,14 @@ impl<'a> RendezvousServerConnection<'a> {
                         .mailboxes_mut()
                         .get_mut(&Mailbox(nameplate.clone()))
                     {
-                        released = mailbox.release_client(self.side.as_ref().unwrap())
+                        released = mailbox.release_client(&self.side)
                     }
 
                     released
                 };
 
                 if released {
-                    self.send_msg(&ServerMessage::Released).await;
+                    self.send_msg(&ServerMessage::Released).await?;
                     Ok(())
                 } else {
                     Err(ClientConnectionError::NotConnectedToMailbox(Mailbox(
@@ -429,21 +451,17 @@ impl<'a> RendezvousServerConnection<'a> {
                 }
             }
             ClientMessage::Close { mailbox, mood } => {
-                println!(
-                    "Closed mailbox for client: {}. Mood: {}",
-                    self.side.as_ref().unwrap(),
-                    mood
-                );
+                println!("Closed mailbox for client: {}. Mood: {}", self.side, mood);
                 let closed = {
                     if let Some(mailbox) = self.state.write().mailboxes_mut().get_mut(&mailbox) {
-                        mailbox.remove_client(&self.side.as_ref().unwrap())
+                        mailbox.remove_client(&self.side)
                     } else {
                         false
                     }
                 };
 
                 if closed {
-                    self.send_msg(&ServerMessage::Closed).await;
+                    self.send_msg(&ServerMessage::Closed).await?;
                     Ok(())
                 } else {
                     Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
