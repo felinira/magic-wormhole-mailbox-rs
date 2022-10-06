@@ -57,6 +57,8 @@ pub enum ClientConnectionError {
     TooManyClients,
     #[error("Not connected to mailbox {}", _0)]
     NotConnectedToMailbox(Mailbox),
+    #[error("Not claimed any mailbox")]
+    NotClaimedAnyMailbox,
     #[error("An internal inconsistency has been found")]
     Inconsistency,
 }
@@ -143,13 +145,10 @@ pub struct RendezvousServerConnection<'a> {
     state: RendezvousServerState,
     websocket: &'a mut WebSocketStream<TcpStream>,
 
-    app: AppID,
-    side: EitherSide,
-    mailbox_id: Mailbox,
+    app: Option<AppID>,
+    side: Option<EitherSide>,
+    mailbox_id: Option<Mailbox>,
     broadcast_receiver: async_broadcast::Receiver<EncryptedMessage>,
-
-    did_release: bool,
-    did_open: bool,
 }
 
 impl<'a> RendezvousServerConnection<'a> {
@@ -258,13 +257,10 @@ impl<'a> RendezvousServerConnection<'a> {
         Ok(Self {
             state,
             websocket,
-            app,
-            side,
-            mailbox_id,
+            app: Some(app),
+            side: Some(side),
+            mailbox_id: Some(mailbox_id),
             broadcast_receiver,
-
-            did_release: false,
-            did_open: false,
         })
     }
 
@@ -281,7 +277,7 @@ impl<'a> RendezvousServerConnection<'a> {
                             match err {
                                 ReceiveError::Closed(close_frame) => {
                                     // Regular closing of the WebSocket
-                                    println!("WebSocket closed by peer: {}", self.side);
+                                    println!("WebSocket closed by peer: {}", self.side.as_ref().unwrap_or(&EitherSide("???".to_string())));
                                     self.websocket.close(close_frame).await;
                                     break;
                                 }
@@ -297,7 +293,7 @@ impl<'a> RendezvousServerConnection<'a> {
                 msg_res = self.broadcast_receiver.recv().fuse() => {
                     match msg_res {
                         Ok(msg) => {
-                            println!("Sending msg: {} to peer {}", msg, self.side);
+                            println!("Sending msg: {} to peer {}", msg, &self.side.as_ref().unwrap_or(&EitherSide("???".to_string())));
                             self.send_msg(&ServerMessage::Message(msg)).await?;
                         }
                         Err(err) => {
@@ -343,11 +339,14 @@ impl<'a> RendezvousServerConnection<'a> {
     async fn handle_error_release(&mut self, error: ClientConnectionError) {
         self.handle_error(error);
 
-        self.state
-            .write()
-            .app_mut(&self.app)
-            .mailbox_mut(&self.mailbox_id)
-            .map(|m| m.client_mut(&self.side).map(|c| c.release()));
+        if let (Some(app), Some(mailbox_id), Some(side)) = (&self.app, &self.mailbox_id, &self.side)
+        {
+            self.state
+                .write()
+                .app_mut(app)
+                .mailbox_mut(mailbox_id)
+                .map(|m| m.client_mut(side).map(|c| c.release()));
+        }
     }
 
     #[must_use]
@@ -402,80 +401,101 @@ impl<'a> RendezvousServerConnection<'a> {
     ) -> Result<(), ClientConnectionError> {
         match client_msg {
             ClientMessage::Add { phase, body } => {
-                let mut broadcast = self
-                    .state
-                    .write()
-                    .app_mut(&self.app)
-                    .mailbox_mut(&self.mailbox_id)
-                    .unwrap()
-                    .broadcast_sender();
-
-                // send the message to the broadcast channel
-                broadcast
-                    .broadcast(EncryptedMessage {
-                        side: self.side.clone().0.into(),
-                        phase: phase.clone(),
-                        body: body.clone(),
-                    })
-                    .await
-                    .unwrap();
-
-                // update last activity timestamp
-                self.state
-                    .write()
-                    .app_mut(&self.app)
-                    .mailbox_mut(&self.mailbox_id)
-                    .unwrap()
-                    .update_last_activity();
-
-                Ok(())
-            }
-            ClientMessage::Release { nameplate } => {
-                let released = {
-                    let mut released = false;
-                    if let Some(mailbox) = self
+                if let (Some(app), Some(mailbox_id), Some(side)) =
+                    (&self.app, &self.mailbox_id, &self.side)
+                {
+                    let mut broadcast = self
                         .state
                         .write()
-                        .app_mut(&mut self.app)
-                        .mailboxes_mut()
-                        .get_mut(&Mailbox(nameplate.clone()))
-                    {
-                        released = mailbox.release_client(&self.side)
-                    }
+                        .app_mut(&app)
+                        .mailbox_mut(&mailbox_id)
+                        .unwrap()
+                        .broadcast_sender();
 
-                    released
-                };
+                    // send the message to the broadcast channel
+                    broadcast
+                        .broadcast(EncryptedMessage {
+                            side: side.clone().0.into(),
+                            phase: phase.clone(),
+                            body: body.clone(),
+                        })
+                        .await
+                        .unwrap();
 
-                if released {
-                    self.send_msg(&ServerMessage::Released).await?;
+                    // update last activity timestamp
+                    self.state
+                        .write()
+                        .app_mut(&app)
+                        .mailbox_mut(&mailbox_id)
+                        .unwrap()
+                        .update_last_activity();
+
                     Ok(())
                 } else {
-                    Err(ClientConnectionError::NotConnectedToMailbox(Mailbox(
-                        nameplate,
-                    )))
+                    Err(ClientConnectionError::NotClaimedAnyMailbox)
+                }
+            }
+            ClientMessage::Release { nameplate } => {
+                if let (Some(app), Some(mailbox_id), Some(side)) =
+                    (&self.app, &self.mailbox_id, &self.side)
+                {
+                    let released = {
+                        let mut released = false;
+                        if let Some(mailbox) = self
+                            .state
+                            .write()
+                            .app_mut(app)
+                            .mailbox_mut(&Mailbox(nameplate.clone()))
+                        {
+                            released = mailbox.release_client(&side)
+                        }
+
+                        released
+                    };
+
+                    if released {
+                        self.send_msg(&ServerMessage::Released).await?;
+                        Ok(())
+                    } else {
+                        Err(ClientConnectionError::NotConnectedToMailbox(Mailbox(
+                            nameplate,
+                        )))
+                    }
+                } else {
+                    Err(ClientConnectionError::NotClaimedAnyMailbox)
                 }
             }
             ClientMessage::Close { mailbox, mood } => {
-                println!("Closed mailbox for client: {}. Mood: {}", self.side, mood);
-                let closed = {
-                    if let Some(mailbox) = self
-                        .state
-                        .write()
-                        .app_mut(&mut self.app)
-                        .mailboxes_mut()
-                        .get_mut(&mailbox)
-                    {
-                        mailbox.remove_client(&self.side)
+                if let (Some(app), Some(mailbox_id), Some(side)) =
+                    (&self.app, &self.mailbox_id, &self.side)
+                {
+                    if &mailbox != mailbox_id {
+                        Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
                     } else {
-                        false
-                    }
-                };
+                        println!("Closed mailbox for client: {}. Mood: {}", side, mood);
+                        let closed = {
+                            if let Some(mailbox) = self
+                                .state
+                                .write()
+                                .app_mut(app)
+                                .mailboxes_mut()
+                                .get_mut(&mailbox)
+                            {
+                                mailbox.remove_client(&side)
+                            } else {
+                                false
+                            }
+                        };
 
-                if closed {
-                    self.send_msg(&ServerMessage::Closed).await?;
-                    Ok(())
+                        if closed {
+                            self.send_msg(&ServerMessage::Closed).await?;
+                            Ok(())
+                        } else {
+                            Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
+                        }
+                    }
                 } else {
-                    Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
+                    Err(ClientConnectionError::NotClaimedAnyMailbox)
                 }
             }
             _ => Err(ClientConnectionError::UnexpectedMessage(client_msg)),
