@@ -1,3 +1,4 @@
+use crate::core::AppID;
 use crate::core::{EitherSide, Mailbox, Nameplate};
 use crate::rendezvous_server::mailbox::{ClaimedMailbox, MailboxClient};
 use derive_more::Deref;
@@ -12,12 +13,12 @@ use std::time::Duration;
 const MAX_MAILBOXES: usize = 1024;
 
 #[derive(Default)]
-pub(crate) struct RendezvousServerStateInner {
+pub(crate) struct RendezvousServerApp {
     mailboxes: HashMap<Mailbox, ClaimedMailbox>,
     allocations: HashMap<Nameplate, (EitherSide, std::time::Instant)>,
 }
 
-impl RendezvousServerStateInner {
+impl RendezvousServerApp {
     pub fn try_claim(&mut self, nameplate: &Nameplate, client_id: EitherSide) -> Option<Mailbox> {
         if self.mailboxes.len() > MAX_MAILBOXES {
             // Sorry, no mailboxes are free at the moment
@@ -151,6 +152,54 @@ impl RendezvousServerStateInner {
 
     pub fn allocations_mut(&mut self) -> &mut HashMap<Nameplate, (EitherSide, std::time::Instant)> {
         &mut self.allocations
+    }
+}
+
+#[derive(Default)]
+pub(crate) struct RendezvousServerStateInner {
+    apps: HashMap<AppID, RendezvousServerApp>,
+}
+
+impl RendezvousServerStateInner {
+    pub fn app(&self, app_id: &AppID) -> Option<&RendezvousServerApp> {
+        self.apps.get(app_id)
+    }
+
+    /// Creates app if it doesn't exist yet
+    pub fn app_mut(&mut self, app_id: &AppID) -> &mut RendezvousServerApp {
+        self.apps.entry(app_id.clone()).or_insert_with(|| {
+            println!("Spawning app with id: {app_id}");
+            RendezvousServerApp::default()
+        })
+    }
+
+    pub fn cleanup_allocations(&mut self) {
+        for app in self.apps.values_mut() {
+            app.cleanup_allocations();
+        }
+    }
+
+    pub fn cleanup_mailboxes(&mut self) {
+        for app in self.apps.values_mut() {
+            app.cleanup_mailboxes();
+        }
+    }
+
+    pub fn cleanup_apps(&mut self) {
+        self.apps.retain(|key, app| {
+            if app.mailboxes.is_empty() && !app.allocations.is_empty() {
+                println!("Cleaning up app with id {key}");
+                false
+            } else {
+                true
+            }
+        });
+    }
+
+    pub fn cleanup_all(&mut self) {
+        self.cleanup_allocations();
+        self.cleanup_mailboxes();
+        self.cleanup_apps();
     }
 }
 

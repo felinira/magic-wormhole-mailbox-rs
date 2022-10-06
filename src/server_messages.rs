@@ -1,5 +1,4 @@
-use crate::core::{Mailbox, Mood, MySide, Nameplate, Phase, TheirSide};
-use magic_wormhole::AppID;
+use crate::core::{AppID, Mailbox, Mood, MySide, Nameplate, Phase, TheirSide};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 

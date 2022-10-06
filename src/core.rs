@@ -60,7 +60,15 @@ impl<V: serde::Serialize> AppConfig<V> {
 /// to that name, effectively separating different protocols
 /// on the same rendezvous_server server.
 #[derive(
-    PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display, derive_more::Deref,
+    Hash,
+    PartialEq,
+    Eq,
+    Clone,
+    Debug,
+    Deserialize,
+    Serialize,
+    derive_more::Display,
+    derive_more::Deref,
 )]
 #[deref(forward)]
 pub struct AppID(#[deref] pub Cow<'static, str>);

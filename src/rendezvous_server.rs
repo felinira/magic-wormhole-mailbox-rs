@@ -3,7 +3,7 @@ mod state;
 
 use self::mailbox::ClaimedMailbox;
 use self::state::RendezvousServerState;
-use crate::core::{EitherSide, Mailbox, Nameplate, TheirSide};
+use crate::core::{AppID, EitherSide, Mailbox, Nameplate, TheirSide};
 use crate::server_messages::*;
 use async_std::net::TcpStream;
 use async_tungstenite::tungstenite::Error;
@@ -11,7 +11,6 @@ use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::future::err;
 use futures::stream::FusedStream;
 use futures::{pending, poll, select, AsyncReadExt, FutureExt, SinkExt, StreamExt};
-use magic_wormhole::AppID;
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
@@ -83,8 +82,7 @@ impl RendezvousServer {
             let mut timer = async_io::Timer::interval(CLEANUP_INTERVAL);
             loop {
                 timer.next().await;
-                state_clone.write().cleanup_allocations();
-                state_clone.write().cleanup_mailboxes();
+                state_clone.write().cleanup_all();
             }
         });
 
@@ -187,7 +185,7 @@ impl<'a> RendezvousServerConnection<'a> {
             let msg = Self::receive_msg_ws(websocket).await?;
             match &msg {
                 ClientMessage::Allocate => {
-                    let allocation = state.write().allocate(&side);
+                    let allocation = state.write().app_mut(&app).allocate(&side);
 
                     if let Some(allocation) = allocation {
                         Self::send_msg_ws(
@@ -206,6 +204,7 @@ impl<'a> RendezvousServerConnection<'a> {
 
                     if state
                         .write()
+                        .app_mut(&app)
                         .try_claim(&Nameplate(nameplate.to_string()), side.clone())
                         .is_none()
                     {
@@ -233,6 +232,7 @@ impl<'a> RendezvousServerConnection<'a> {
             ClientMessage::Open { mailbox } => {
                 let opened = state
                     .write()
+                    .app_mut(&app)
                     .mailboxes_mut()
                     .get_mut(&mailbox)
                     .unwrap()
@@ -250,6 +250,7 @@ impl<'a> RendezvousServerConnection<'a> {
 
         let broadcast_receiver = state
             .write()
+            .app_mut(&app)
             .mailbox_mut(&mailbox_id)
             .unwrap()
             .new_broadcast_receiver();
@@ -344,6 +345,7 @@ impl<'a> RendezvousServerConnection<'a> {
 
         self.state
             .write()
+            .app_mut(&self.app)
             .mailbox_mut(&self.mailbox_id)
             .map(|m| m.client_mut(&self.side).map(|c| c.release()));
     }
@@ -403,6 +405,7 @@ impl<'a> RendezvousServerConnection<'a> {
                 let mut broadcast = self
                     .state
                     .write()
+                    .app_mut(&self.app)
                     .mailbox_mut(&self.mailbox_id)
                     .unwrap()
                     .broadcast_sender();
@@ -420,6 +423,7 @@ impl<'a> RendezvousServerConnection<'a> {
                 // update last activity timestamp
                 self.state
                     .write()
+                    .app_mut(&self.app)
                     .mailbox_mut(&self.mailbox_id)
                     .unwrap()
                     .update_last_activity();
@@ -432,6 +436,7 @@ impl<'a> RendezvousServerConnection<'a> {
                     if let Some(mailbox) = self
                         .state
                         .write()
+                        .app_mut(&mut self.app)
                         .mailboxes_mut()
                         .get_mut(&Mailbox(nameplate.clone()))
                     {
@@ -453,7 +458,13 @@ impl<'a> RendezvousServerConnection<'a> {
             ClientMessage::Close { mailbox, mood } => {
                 println!("Closed mailbox for client: {}. Mood: {}", self.side, mood);
                 let closed = {
-                    if let Some(mailbox) = self.state.write().mailboxes_mut().get_mut(&mailbox) {
+                    if let Some(mailbox) = self
+                        .state
+                        .write()
+                        .app_mut(&mut self.app)
+                        .mailboxes_mut()
+                        .get_mut(&mailbox)
+                    {
                         mailbox.remove_client(&self.side)
                     } else {
                         false
