@@ -263,7 +263,7 @@ impl<'a> RendezvousServerConnection<'a> {
     }
 
     async fn send_msg(&mut self, msg: &ServerMessage) -> Result<(), tungstenite::Error> {
-        Self::send_msg_ws(&mut self.websocket, msg).await
+        Self::send_msg_ws(self.websocket, msg).await
     }
 
     async fn handle_error(&mut self, error: ClientConnectionError) {
@@ -280,12 +280,11 @@ impl<'a> RendezvousServerConnection<'a> {
         }
     }
 
-    #[must_use]
     async fn receive_msg_ws(
         websocket: &mut WebSocketStream<TcpStream>,
     ) -> Result<ClientMessage, ReceiveError> {
-        while let Some(msg) = websocket.next().await {
-            return match msg {
+        if let Some(msg) = websocket.next().await {
+            match msg {
                 Ok(msg) => match msg {
                     tungstenite::Message::Text(msg_txt) => {
                         println!("Receive: {}", msg_txt);
@@ -301,18 +300,16 @@ impl<'a> RendezvousServerConnection<'a> {
                     msg => Err(ReceiveError::UnexpectedType(msg)),
                 },
                 Err(err) => Err(err.into()),
-            };
+            }
+        } else {
+            Err(ReceiveError::Closed(None))
         }
-
-        Err(ReceiveError::Closed(None))
     }
 
-    #[must_use]
     async fn receive_msg(&mut self) -> Result<ClientMessage, ReceiveError> {
         Self::receive_msg_ws(self.websocket).await
     }
 
-    #[must_use]
     async fn handle_client_msg(
         &mut self,
         client_msg: ClientMessage,
@@ -332,7 +329,7 @@ impl<'a> RendezvousServerConnection<'a> {
                     if self.allocation.is_some() {
                         Err(ClientConnectionError::AllocateTwice)
                     } else {
-                        let allocation = self.state.write().app_mut(&app).allocate(&side);
+                        let allocation = self.state.write().app_mut(app).allocate(side);
 
                         if let Some(allocation) = allocation {
                             self.send_msg(&ServerMessage::Allocated {
@@ -358,7 +355,7 @@ impl<'a> RendezvousServerConnection<'a> {
                         if self
                             .state
                             .write()
-                            .app_mut(&app)
+                            .app_mut(app)
                             .try_claim(&Nameplate(nameplate.to_string()), side.clone())
                             .is_none()
                         {
@@ -385,12 +382,9 @@ impl<'a> RendezvousServerConnection<'a> {
                         Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
                     } else {
                         let mut lock = self.state.write();
-                        let claimed_mailbox = lock
-                            .app_mut(&app)
-                            .mailboxes_mut()
-                            .get_mut(&mailbox)
-                            .unwrap();
-                        if claimed_mailbox.open_client(&side) {
+                        let claimed_mailbox =
+                            lock.app_mut(app).mailboxes_mut().get_mut(&mailbox).unwrap();
+                        if claimed_mailbox.open_client(side) {
                             self.broadcast_receiver =
                                 Some(claimed_mailbox.new_broadcast_receiver());
                             self.broadcast_sender = Some(claimed_mailbox.broadcast_sender());
@@ -426,8 +420,8 @@ impl<'a> RendezvousServerConnection<'a> {
                     // update last activity timestamp
                     self.state
                         .write()
-                        .app_mut(&app)
-                        .mailbox_mut(&mailbox_id)
+                        .app_mut(app)
+                        .mailbox_mut(mailbox_id)
                         .unwrap()
                         .update_last_activity();
 
@@ -448,7 +442,7 @@ impl<'a> RendezvousServerConnection<'a> {
                             .app_mut(app)
                             .mailbox_mut(&Mailbox(nameplate.clone()))
                         {
-                            released = mailbox.release_client(&side)
+                            released = mailbox.release_client(side)
                         }
 
                         released
@@ -482,7 +476,7 @@ impl<'a> RendezvousServerConnection<'a> {
                                 .mailboxes_mut()
                                 .get_mut(&mailbox)
                             {
-                                mailbox.remove_client(&side)
+                                mailbox.remove_client(side)
                             } else {
                                 false
                             }
@@ -501,15 +495,17 @@ impl<'a> RendezvousServerConnection<'a> {
             }
             ClientMessage::List => {
                 if let Some(app) = &self.app {
-                    let nameplates = self.state.read().app(app).map_or_else(
-                        || Vec::new(),
-                        |app| {
+                    let nameplates = self
+                        .state
+                        .read()
+                        .app(app)
+                        .map(|app| {
                             app.mailboxes()
                                 .keys()
                                 .map(|m| Nameplate(m.to_string()))
                                 .collect()
-                        },
-                    );
+                        })
+                        .unwrap_or_default();
                     self.send_msg(&ServerMessage::Nameplates { nameplates });
                     Ok(())
                 } else {

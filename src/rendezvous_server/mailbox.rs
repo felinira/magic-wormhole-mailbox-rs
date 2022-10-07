@@ -81,7 +81,7 @@ impl ClaimedMailbox {
         } else {
             let client = MailboxClient::new(client_id);
             self.clients.push(client);
-            self.clients.get(self.clients.len() - 1)
+            self.clients.last()
         }
     }
 
@@ -129,10 +129,7 @@ impl ClaimedMailbox {
     }
 
     pub fn has_client(&self, client_id: &EitherSide) -> bool {
-        self.clients
-            .iter()
-            .find(|client| client.id() == client_id)
-            .is_some()
+        self.clients.iter().any(|client| client.id() == client_id)
     }
 
     pub fn open_client(&mut self, client_id: &EitherSide) -> bool {
@@ -153,7 +150,7 @@ impl ClaimedMailbox {
             }
         }
 
-        return false;
+        false
     }
 
     pub async fn close_mailbox(&mut self) {
