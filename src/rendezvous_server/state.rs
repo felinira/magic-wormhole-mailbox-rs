@@ -1,61 +1,159 @@
 use crate::core::AppID;
 use crate::core::{EitherSide, Mailbox, Nameplate};
-use crate::rendezvous_server::mailbox::{ClaimedMailbox, MailboxClient};
+use crate::rendezvous_server::mailbox::ClaimedMailbox;
+use crate::rendezvous_server::nameplate::ClaimedNameplate;
 use derive_more::Deref;
 use parking_lot::{
     MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
 };
-use std::collections::HashMap;
+use rand::distributions::DistString;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
-// Limit of max open mailboxes
-const MAX_MAILBOXES: usize = 1024;
+// Limit of max open nameplate allocations
+const MAX_NAMEPLATES: usize = 1024;
+
+// Two hour old nameplate claims will get deleted
+const MAX_NAMEPLATE_CLAIM_TIME: std::time::Duration = Duration::from_secs(60 * 60 * 2);
+
+// Max mailbox open time is 3 days
+const MAX_MAILBOX_OPEN_TIME: std::time::Duration = Duration::from_secs(60 * 60 * 24 * 3);
+
+// Maximum time a mailbox is left open without any traffic
+const MAX_MAILBOX_IDLE_TIME: std::time::Duration = Duration::from_secs(60 * 60 * 2);
 
 #[derive(Default)]
 pub(crate) struct RendezvousServerApp {
     mailboxes: HashMap<Mailbox, ClaimedMailbox>,
-    allocations: HashMap<Nameplate, (EitherSide, std::time::Instant)>,
+    allocations: HashMap<Nameplate, ClaimedNameplate>,
 }
 
 impl RendezvousServerApp {
-    pub fn try_claim(&mut self, nameplate: &Nameplate, client_id: EitherSide) -> Option<Mailbox> {
-        if self.mailboxes.len() > MAX_MAILBOXES {
-            // Sorry, no mailboxes are free at the moment
+    fn generate_mailbox_id(&self) -> Mailbox {
+        let mut char_count = 4;
+        loop {
+            for _ in 0..10 {
+                let mailbox = Mailbox(
+                    rand::distributions::Alphanumeric
+                        .sample_string(&mut rand::thread_rng(), char_count),
+                );
+                if !self.mailboxes.contains_key(&mailbox.clone()) {
+                    return mailbox;
+                }
+            }
+
+            char_count *= 2;
+        }
+    }
+
+    pub fn allocate_nameplate(&mut self, side: &EitherSide) -> Option<Nameplate> {
+        if self.allocations.len() + self.mailboxes.len() >= MAX_NAMEPLATES {
+            // Sorry, we are full at the moment
             return None;
         }
 
-        let mailbox_id = Mailbox(nameplate.to_string());
-
-        if self.mailboxes.get(&mailbox_id).is_none() {
-            // We check allocations if the mailbox is not open yet
-            if let Some((allocated_client_id, _time)) = self.allocations.get(nameplate) {
-                if &client_id != allocated_client_id {
-                    // This allocation was not for you
-                    return None;
-                } else {
-                    self.allocations.remove(nameplate);
-                }
-            }
-
-            self.mailboxes
-                .insert(mailbox_id.clone(), ClaimedMailbox::new(client_id));
-            return Some(mailbox_id);
-        } else if !self.mailbox_has_client(&mailbox_id, &client_id) {
-            let claimed_mailbox = self.mailboxes.get_mut(&mailbox_id);
-            if let Some(claimed_mailbox) = claimed_mailbox {
-                if claimed_mailbox.add_client(client_id).is_some() {
-                    return Some(mailbox_id);
-                }
+        for key in 1..MAX_NAMEPLATES {
+            if self
+                .claim_nameplate(&Nameplate(key.to_string()), &side)
+                .is_some()
+            {
+                return Some(Nameplate(key.to_string()));
             }
         }
 
+        // MAX_ALLOCATIONS reached
         None
     }
 
+    pub fn claim_nameplate(&mut self, nameplate: &Nameplate, side: &EitherSide) -> Option<Mailbox> {
+        let mut claimed_nameplate =
+            if let Some(claimed_nameplate) = self.allocations.get_mut(&nameplate) {
+                claimed_nameplate
+            } else {
+                let mailbox_id = self.generate_mailbox_id();
+                self.add_or_get_mailbox(&mailbox_id, Some(&nameplate));
+
+                let claimed_nameplate = ClaimedNameplate::new(mailbox_id);
+                self.allocations
+                    .entry(nameplate.clone())
+                    .or_insert(claimed_nameplate)
+            };
+
+        claimed_nameplate.add_client(side.clone());
+        Some(claimed_nameplate.mailbox().clone())
+    }
+
+    pub fn release_nameplate(&mut self, nameplate_id: &Nameplate, client_id: &EitherSide) -> bool {
+        if let Some(claimed_nameplate) = self.allocations.get_mut(nameplate_id) {
+            if claimed_nameplate.remove_client(client_id) {
+                if claimed_nameplate.is_empty() {
+                    // Cleanup nameplate
+                    self.allocations.remove(nameplate_id);
+                }
+
+                return true;
+            }
+        }
+
+        false
+    }
+
+    fn add_or_get_mailbox(
+        &mut self,
+        mailbox: &Mailbox,
+        nameplate: Option<&Nameplate>,
+    ) -> &mut ClaimedMailbox {
+        self.mailboxes
+            .entry(mailbox.clone())
+            .or_insert_with(|| ClaimedMailbox::new(nameplate.cloned()))
+    }
+
+    pub fn open_mailbox(
+        &mut self,
+        mailbox_id: &Mailbox,
+        client_id: &EitherSide,
+    ) -> Option<Mailbox> {
+        let mut mailbox = self.add_or_get_mailbox(mailbox_id, None);
+        if mailbox.add_client(client_id.clone()) {
+            Some(mailbox_id.clone())
+        } else {
+            None
+        }
+    }
+
+    pub fn close_mailbox(&mut self, mailbox_id: &Mailbox, client_id: &EitherSide) -> bool {
+        println!("Closing mailbox {} for client {}", mailbox_id, client_id);
+
+        let mut claimed_mailbox = self.mailboxes.get_mut(mailbox_id);
+        if let Some(claimed_mailbox) = claimed_mailbox {
+            if claimed_mailbox.has_client(client_id) {
+                claimed_mailbox.remove_client(client_id);
+                if claimed_mailbox.is_empty() {
+                    println!("Removing mailbox {}", mailbox_id);
+                    self.mailboxes.remove(mailbox_id);
+                }
+
+                return true;
+            }
+        }
+
+        false
+    }
+
     pub fn cleanup_allocations(&mut self) {
-        self.allocations
-            .retain(|_nameplate, (_client_id, time)| time.elapsed() < Duration::from_secs(60));
+        self.allocations.retain(|_nameplate, claimed_nameplate| {
+            if claimed_nameplate.is_empty() {
+                return false;
+            }
+
+            // Two hours is maximum nameplate claim time
+            if claimed_nameplate.creation_time().elapsed() > MAX_NAMEPLATE_CLAIM_TIME {
+                true
+            } else {
+                false
+            }
+        });
     }
 
     pub fn cleanup_mailboxes(&mut self) {
@@ -65,22 +163,13 @@ impl RendezvousServerApp {
                 return false;
             }
 
-            // 72 hours after creation in any case
-            let creation_duration = Duration::from_secs(60 * 60 * 72);
+            let creation_duration = MAX_MAILBOX_OPEN_TIME;
             if mailbox.creation_time().elapsed() > creation_duration {
                 println!("Removed mailbox {}: Too old", nameplate);
                 return false;
             }
 
-            let activity_duration = if mailbox.is_full() {
-                //24 hours after last message
-                Duration::from_secs(60 * 60 * 24)
-            } else {
-                // 2 hours after last activity if mailbox is not full
-                Duration::from_secs(60 * 60 * 2)
-            };
-
-            if mailbox.last_activity().elapsed() > activity_duration {
+            if mailbox.last_activity().elapsed() > MAX_MAILBOX_IDLE_TIME {
                 println!("Removed mailbox {}: No recent activity", nameplate);
                 false
             } else {
@@ -89,49 +178,9 @@ impl RendezvousServerApp {
         })
     }
 
-    pub fn allocate(&mut self, client_id: &EitherSide) -> Option<Nameplate> {
-        if self.allocations.len() + self.mailboxes.len() >= MAX_MAILBOXES {
-            // Sorry, we are full at the moment
-            return None;
-        }
-
-        for key in 1..MAX_MAILBOXES {
-            let mailbox_id = Mailbox(key.to_string());
-            let nameplate = Nameplate(key.to_string());
-            if !self.mailboxes.contains_key(&mailbox_id)
-                && !self.allocations.contains_key(&nameplate)
-            {
-                self.allocations.insert(
-                    nameplate.clone(),
-                    (client_id.clone(), std::time::Instant::now()),
-                );
-                return Some(nameplate);
-            }
-        }
-
-        // MAX_ALLOCATIONS reached
-        None
-    }
-
     pub fn mailbox_has_client(&self, nameplate: &Mailbox, client_id: &EitherSide) -> bool {
         if let Some(mailbox) = self.mailboxes.get(nameplate) {
             mailbox.has_client(client_id)
-        } else {
-            false
-        }
-    }
-
-    pub fn remove_client(&mut self, mailbox_id: &Mailbox, client: &EitherSide) -> bool {
-        println!("Removing client {} from mailbox {}", client, mailbox_id);
-        let mailbox = self.mailboxes.get_mut(mailbox_id);
-        if let Some(mailbox) = mailbox {
-            let res = mailbox.remove_client(client);
-
-            if mailbox.is_empty() {
-                self.mailboxes.remove(mailbox_id);
-            }
-
-            res
         } else {
             false
         }
@@ -153,7 +202,7 @@ impl RendezvousServerApp {
         self.mailboxes.get_mut(mailbox_id)
     }
 
-    pub fn allocations_mut(&mut self) -> &mut HashMap<Nameplate, (EitherSide, std::time::Instant)> {
+    pub fn allocations_mut(&mut self) -> &mut HashMap<Nameplate, ClaimedNameplate> {
         &mut self.allocations
     }
 }

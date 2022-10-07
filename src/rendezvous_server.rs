@@ -1,4 +1,5 @@
 mod mailbox;
+mod nameplate;
 mod state;
 
 use self::mailbox::ClaimedMailbox;
@@ -64,6 +65,8 @@ pub enum ClientConnectionError {
     AllocateTwice,
     #[error("Can only claim a mailbox once")]
     ClaimTwice,
+    #[error("Nameplate {} was not claimed by this side, can't release", _0)]
+    NotClaimed(Nameplate),
     #[error("Received unexpected message: {}", _0)]
     UnexpectedMessage(ClientMessage),
     #[error("Too many clients connected")]
@@ -273,14 +276,22 @@ impl<'a> RendezvousServerConnection<'a> {
     async fn handle_error(&mut self, error: ClientConnectionError) {
         self.handle_error(error);
 
-        if let (Some(app), Some(mailbox_id), Some(side)) = (&self.app, &self.mailbox_id, &self.side)
-        {
-            // If a mailbox was claimed we release it
-            self.state
-                .write()
-                .app_mut(app)
-                .mailbox_mut(mailbox_id)
-                .map(|m| m.client_mut(side).map(|c| c.release()));
+        if let (Some(app), Some(side)) = (&self.app, &self.side) {
+            if let Some(nameplate) = &self.allocation {
+                // If a nameplate was claimed we release it
+                self.state
+                    .write()
+                    .app_mut(app)
+                    .release_nameplate(nameplate, side);
+            }
+
+            if let Some(mailbox_id) = &self.mailbox_id {
+                // If a mailbox was open we close it
+                self.state
+                    .write()
+                    .app_mut(app)
+                    .close_mailbox(mailbox_id, side);
+            }
         }
     }
 
@@ -333,7 +344,7 @@ impl<'a> RendezvousServerConnection<'a> {
                     if self.allocation.is_some() {
                         Err(ClientConnectionError::AllocateTwice)
                     } else {
-                        let allocation = self.state.write().app_mut(app).allocate(side);
+                        let allocation = self.state.write().app_mut(app).allocate_nameplate(&side);
 
                         if let Some(allocation) = allocation {
                             self.send_msg(&ServerMessage::Allocated {
@@ -355,23 +366,22 @@ impl<'a> RendezvousServerConnection<'a> {
                         Err(ClientConnectionError::ClaimTwice)
                     } else {
                         println!("Claiming mailbox: {}", nameplate);
+                        let nameplate = Nameplate(nameplate);
 
-                        if self
+                        let mailbox = self
                             .state
                             .write()
                             .app_mut(app)
-                            .try_claim(&Nameplate(nameplate.to_string()), side.clone())
-                            .is_none()
-                        {
-                            Err(ClientConnectionError::TooManyClients)
-                        } else {
-                            let mailbox_id = Mailbox(nameplate.to_string());
-                            self.mailbox_id = Some(mailbox_id.clone());
+                            .claim_nameplate(&nameplate, &side);
+                        self.mailbox_id = mailbox;
+                        if let Some(mailbox) = &self.mailbox_id {
                             self.send_msg(&ServerMessage::Claimed {
-                                mailbox: mailbox_id,
+                                mailbox: mailbox.clone(),
                             })
                             .await?;
                             Ok(())
+                        } else {
+                            Err(ClientConnectionError::TooManyClients)
                         }
                     }
                 } else {
@@ -379,26 +389,19 @@ impl<'a> RendezvousServerConnection<'a> {
                 }
             }
             ClientMessage::Open { mailbox } => {
-                if let (Some(app), Some(mailbox_id), Some(side)) =
-                    (&self.app, &self.mailbox_id, &self.side)
-                {
-                    if &mailbox != mailbox_id {
-                        Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
-                    } else {
-                        let mut lock = self.state.write();
+                if let (Some(app), Some(side)) = (&self.app, &self.side) {
+                    let mut lock = self.state.write();
+                    if let Some(mailbox) = lock.app_mut(app).open_mailbox(&mailbox, &side) {
                         let claimed_mailbox =
                             lock.app_mut(app).mailboxes_mut().get_mut(&mailbox).unwrap();
-                        if claimed_mailbox.open_client(side) {
-                            self.broadcast_receiver =
-                                Some(claimed_mailbox.new_broadcast_receiver());
-                            self.broadcast_sender = Some(claimed_mailbox.broadcast_sender());
+                        self.broadcast_receiver = Some(claimed_mailbox.new_broadcast_receiver());
+                        self.broadcast_sender = Some(claimed_mailbox.broadcast_sender());
 
-                            Ok(())
-                        } else {
-                            Err(ClientConnectionError::NotConnectedToMailbox(
-                                mailbox.clone(),
-                            ))
-                        }
+                        Ok(())
+                    } else {
+                        Err(ClientConnectionError::NotConnectedToMailbox(
+                            mailbox.clone(),
+                        ))
                     }
                 } else {
                     Err(ClientConnectionError::NotClaimedAnyMailbox)
@@ -435,30 +438,18 @@ impl<'a> RendezvousServerConnection<'a> {
                 }
             }
             ClientMessage::Release { nameplate } => {
-                if let (Some(app), Some(mailbox_id), Some(side)) =
-                    (&self.app, &self.mailbox_id, &self.side)
-                {
-                    let released = {
-                        let mut released = false;
-                        if let Some(mailbox) = self
-                            .state
-                            .write()
-                            .app_mut(app)
-                            .mailbox_mut(&Mailbox(nameplate.clone()))
-                        {
-                            released = mailbox.release_client(side)
-                        }
-
-                        released
-                    };
-
-                    if released {
+                if let (Some(app), Some(side)) = (&self.app, &self.side) {
+                    let nameplate = Nameplate(nameplate);
+                    if self
+                        .state
+                        .write()
+                        .app_mut(app)
+                        .release_nameplate(&nameplate, side)
+                    {
                         self.send_msg(&ServerMessage::Released).await?;
                         Ok(())
                     } else {
-                        Err(ClientConnectionError::NotConnectedToMailbox(Mailbox(
-                            nameplate,
-                        )))
+                        Err(ClientConnectionError::NotClaimed(nameplate))
                     }
                 } else {
                     Err(ClientConnectionError::NotClaimedAnyMailbox)
@@ -472,19 +463,11 @@ impl<'a> RendezvousServerConnection<'a> {
                         Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
                     } else {
                         println!("Closed mailbox for client: {}. Mood: {}", side, mood);
-                        let closed = {
-                            if let Some(mailbox) = self
-                                .state
-                                .write()
-                                .app_mut(app)
-                                .mailboxes_mut()
-                                .get_mut(&mailbox)
-                            {
-                                mailbox.remove_client(side)
-                            } else {
-                                false
-                            }
-                        };
+                        let closed = self
+                            .state
+                            .write()
+                            .app_mut(app)
+                            .close_mailbox(mailbox_id, side);
 
                         if closed {
                             self.send_msg(&ServerMessage::Closed).await?;

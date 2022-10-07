@@ -126,7 +126,15 @@ impl<S: Into<String>> From<S> for TheirSide {
 }
 
 #[derive(
-    PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display, derive_more::Deref,
+    Hash,
+    PartialEq,
+    Eq,
+    Clone,
+    Debug,
+    Deserialize,
+    Serialize,
+    derive_more::Display,
+    derive_more::Deref,
 )]
 #[serde(transparent)]
 #[deref(forward)]

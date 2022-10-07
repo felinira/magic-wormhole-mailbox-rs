@@ -1,57 +1,13 @@
-use crate::core::EitherSide;
+use crate::core::{EitherSide, Nameplate};
 use crate::server_messages::{EncryptedMessage, ServerMessage};
+use std::collections::HashSet;
 
 pub type BroadcastSender = async_broadcast::Sender<EncryptedMessage>;
 pub type BroadcastReceiver = async_broadcast::Receiver<EncryptedMessage>;
 
-pub(crate) struct MailboxClient {
-    id: EitherSide,
-    is_open: bool,
-    was_released: bool,
-}
-
-impl MailboxClient {
-    pub fn new(id: EitherSide) -> Self {
-        Self {
-            id,
-            is_open: false,
-            was_released: false,
-        }
-    }
-
-    pub fn id(&self) -> &EitherSide {
-        &self.id
-    }
-
-    /// Can only open once
-    pub fn open(&mut self) -> bool {
-        if self.is_open {
-            return false;
-        }
-
-        if !self.was_released {
-            self.is_open = true;
-        }
-
-        self.is_open
-    }
-
-    pub fn release(&mut self) {
-        self.is_open = false;
-        self.was_released = true;
-    }
-
-    pub fn is_open(&self) -> bool {
-        self.is_open
-    }
-
-    pub fn should_cleanup(&self) -> bool {
-        self.was_released
-    }
-}
-
 pub(crate) struct ClaimedMailbox {
-    clients: Vec<MailboxClient>,
+    nameplate: Option<Nameplate>,
+    clients: HashSet<EitherSide>,
     broadcast_sender: BroadcastSender,
     broadcast_receiver: BroadcastReceiver,
     creation_time: std::time::Instant,
@@ -59,14 +15,14 @@ pub(crate) struct ClaimedMailbox {
 }
 
 impl ClaimedMailbox {
-    pub fn new(first_client_id: EitherSide) -> Self {
+    pub fn new(nameplate: Option<Nameplate>) -> Self {
         let now = std::time::Instant::now();
-        let mut clients = Vec::with_capacity(2);
-        clients.push(MailboxClient::new(first_client_id));
+        let mut clients = HashSet::with_capacity(2);
 
         let (broadcast_sender, broadcast_receiver) = async_broadcast::broadcast(1024);
 
         Self {
+            nameplate,
             clients,
             broadcast_sender,
             broadcast_receiver,
@@ -75,23 +31,20 @@ impl ClaimedMailbox {
         }
     }
 
-    pub fn add_client(&mut self, client_id: EitherSide) -> Option<&MailboxClient> {
+    pub fn nameplate(&self) -> Option<&Nameplate> {
+        self.nameplate.as_ref()
+    }
+
+    pub fn add_client(&mut self, client_id: EitherSide) -> bool {
         if self.is_full() {
-            None
+            false
         } else {
-            let client = MailboxClient::new(client_id);
-            self.clients.push(client);
-            self.clients.last()
+            self.clients.insert(client_id)
         }
     }
 
     pub fn remove_client(&mut self, client_id: &EitherSide) -> bool {
-        if let Some(pos) = self.clients.iter().position(|c| c.id() == client_id) {
-            self.clients.remove(pos);
-            true
-        } else {
-            false
-        }
+        self.clients.remove(client_id)
     }
 
     pub fn is_empty(&self) -> bool {
@@ -102,59 +55,19 @@ impl ClaimedMailbox {
         self.clients.len() >= 2
     }
 
-    pub fn is_full_open(&self) -> bool {
-        self.is_full() && self.clients.iter().all(|client| client.is_open())
-    }
-
     pub fn should_cleanup(&self) -> bool {
-        self.is_empty() || self.clients.iter().all(|c| !c.is_open())
+        self.is_empty()
     }
 
     pub fn client_count(&self) -> usize {
         self.clients.len()
     }
 
-    pub fn clients(&self) -> &[MailboxClient] {
-        &self.clients
-    }
-
-    pub fn client(&self, client_id: &EitherSide) -> Option<&MailboxClient> {
-        self.clients.iter().find(|client| client.id() == client_id)
-    }
-
-    pub fn client_mut(&mut self, client_id: &EitherSide) -> Option<&mut MailboxClient> {
-        self.clients
-            .iter_mut()
-            .find(|client| client.id() == client_id)
-    }
-
     pub fn has_client(&self, client_id: &EitherSide) -> bool {
-        self.clients.iter().any(|client| client.id() == client_id)
-    }
-
-    pub fn open_client(&mut self, client_id: &EitherSide) -> bool {
-        for client in &mut self.clients {
-            if client.id() == client_id {
-                return client.open();
-            }
-        }
-
-        false
-    }
-
-    pub fn release_client(&mut self, client_id: &EitherSide) -> bool {
-        for client in &mut self.clients {
-            if client_id == client.id() {
-                client.release();
-                return true;
-            }
-        }
-
-        false
+        self.clients.contains(client_id)
     }
 
     pub async fn close_mailbox(&mut self) {
-        self.clients.iter_mut().for_each(|client| client.release());
         self.broadcast_receiver.close();
         self.broadcast_sender.close();
     }
