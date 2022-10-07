@@ -59,17 +59,16 @@ impl RendezvousServerApp {
     }
 
     pub fn cleanup_mailboxes(&mut self) {
-        println!("Cleaning up mailboxes");
         self.mailboxes.retain(|nameplate, mailbox| {
             if mailbox.should_cleanup() {
-                println!("Mailbox {} removed", nameplate);
+                println!("Removed mailbox {}: Empty", nameplate);
                 return false;
             }
 
             // 72 hours after creation in any case
             let creation_duration = Duration::from_secs(60 * 60 * 72);
             if mailbox.creation_time().elapsed() > creation_duration {
-                println!("Mailbox {} removed", nameplate);
+                println!("Removed mailbox {}: Too old", nameplate);
                 return false;
             }
 
@@ -82,7 +81,7 @@ impl RendezvousServerApp {
             };
 
             if mailbox.last_activity().elapsed() > activity_duration {
-                println!("Mailbox {} removed", nameplate);
+                println!("Removed mailbox {}: No recent activity", nameplate);
                 false
             } else {
                 true
@@ -191,7 +190,7 @@ impl RendezvousServerStateInner {
 
     pub fn cleanup_apps(&mut self) {
         self.apps.retain(|key, app| {
-            if app.mailboxes.is_empty() && !app.allocations.is_empty() {
+            if app.mailboxes.is_empty() && app.allocations.is_empty() {
                 println!("Cleaning up app with id {key}");
                 false
             } else {
