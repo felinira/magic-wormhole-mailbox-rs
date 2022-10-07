@@ -148,7 +148,8 @@ pub struct RendezvousServerConnection<'a> {
     app: Option<AppID>,
     side: Option<EitherSide>,
     mailbox_id: Option<Mailbox>,
-    broadcast_receiver: async_broadcast::Receiver<EncryptedMessage>,
+    broadcast_receiver: Option<async_broadcast::Receiver<EncryptedMessage>>,
+    broadcast_sender: Option<async_broadcast::Sender<EncryptedMessage>>,
 }
 
 impl<'a> RendezvousServerConnection<'a> {
@@ -225,83 +226,87 @@ impl<'a> RendezvousServerConnection<'a> {
                 }
             };
         }
+        /*
+                let msg = Self::receive_msg_ws(websocket).await?;
+                match &msg {
+                    _ => {
+                        return Err(ClientConnectionError::UnexpectedMessage(msg));
+                    }
+                }
 
-        let msg = Self::receive_msg_ws(websocket).await?;
-        match &msg {
-            ClientMessage::Open { mailbox } => {
-                let opened = state
+                let broadcast_receiver = state
                     .write()
                     .app_mut(&app)
-                    .mailboxes_mut()
-                    .get_mut(&mailbox)
+                    .mailbox_mut(&mailbox_id)
                     .unwrap()
-                    .open_client(&side);
-                if !opened {
-                    return Err(ClientConnectionError::NotConnectedToMailbox(
-                        mailbox.clone(),
-                    ));
-                }
-            }
-            _ => {
-                return Err(ClientConnectionError::UnexpectedMessage(msg));
-            }
-        }
-
-        let broadcast_receiver = state
-            .write()
-            .app_mut(&app)
-            .mailbox_mut(&mailbox_id)
-            .unwrap()
-            .new_broadcast_receiver();
-
+                    .new_broadcast_receiver();
+        */
         Ok(Self {
             state,
             websocket,
             app: Some(app),
             side: Some(side),
             mailbox_id: Some(mailbox_id),
-            broadcast_receiver,
+            broadcast_receiver: None,
+            broadcast_sender: None,
         })
+    }
+
+    async fn handle_receive_err(&mut self, err: ReceiveError) {
+        match err {
+            ReceiveError::Closed(close_frame) => {
+                // Regular closing of the WebSocket
+                println!(
+                    "WebSocket closed by peer: {}",
+                    self.side.as_ref().unwrap_or(&EitherSide("???".to_string()))
+                );
+                self.websocket.close(close_frame).await;
+            }
+            err => {
+                println!("Message receive error: {}", err);
+                self.handle_error_release(err.into()).await;
+            }
+        }
     }
 
     pub async fn handle_connection(&mut self) -> Result<(), ClientConnectionError> {
         // Now we are operating on the open channel
         while !self.websocket.is_terminated() {
-            select! {
-                msg_res = Self::receive_msg_ws(self.websocket).fuse() => {
-                    match msg_res {
-                        Ok(msg) => {
-                            self.handle_client_msg(msg).await.unwrap();
+            if let Some(broadcast_receiver) = &mut self.broadcast_receiver {
+                select! {
+                    msg_res = Self::receive_msg_ws(self.websocket).fuse() => {
+                        match msg_res {
+                            Ok(msg) => {
+                                self.handle_client_msg(msg).await.unwrap();
+                            }
+                            Err(err) => {
+                                self.handle_receive_err(err);
+                                break;}
                         }
-                        Err(err) => {
-                            match err {
-                                ReceiveError::Closed(close_frame) => {
-                                    // Regular closing of the WebSocket
-                                    println!("WebSocket closed by peer: {}", self.side.as_ref().unwrap_or(&EitherSide("???".to_string())));
-                                    self.websocket.close(close_frame).await;
-                                    break;
-                                }
-                                err => {
-                                    println!("Message receive error: {}", err);
-                                    self.handle_error_release(err.into()).await;
-                                    break;
-                                }
+                    },
+                    msg_res = broadcast_receiver.recv().fuse() => {
+                        match msg_res {
+                            Ok(msg) => {
+                                println!("Sending msg: {} to peer {}", msg, &self.side.as_ref().unwrap_or(&EitherSide("???".to_string())));
+                                self.send_msg(&ServerMessage::Message(msg)).await?;
+                            }
+                            Err(err) => {
+                                println!("Message Broadcast error: {}", err);
+                                self.handle_error(ClientConnectionError::Inconsistency)
+                                    .await;
+                                break;
                             }
                         }
                     }
-                },
-                msg_res = self.broadcast_receiver.recv().fuse() => {
-                    match msg_res {
-                        Ok(msg) => {
-                            println!("Sending msg: {} to peer {}", msg, &self.side.as_ref().unwrap_or(&EitherSide("???".to_string())));
-                            self.send_msg(&ServerMessage::Message(msg)).await?;
-                        }
-                        Err(err) => {
-                            println!("Message Broadcast error: {}", err);
-                            self.handle_error(ClientConnectionError::Inconsistency)
-                                .await;
-                            break;
-                        }
+                }
+            } else {
+                match Self::receive_msg_ws(self.websocket).await {
+                    Ok(msg) => {
+                        self.handle_client_msg(msg).await.unwrap();
+                    }
+                    Err(err) => {
+                        self.handle_receive_err(err);
+                        break;
                     }
                 }
             }
@@ -400,20 +405,44 @@ impl<'a> RendezvousServerConnection<'a> {
         client_msg: ClientMessage,
     ) -> Result<(), ClientConnectionError> {
         match client_msg {
-            ClientMessage::Add { phase, body } => {
+            ClientMessage::Open { mailbox } => {
                 if let (Some(app), Some(mailbox_id), Some(side)) =
                     (&self.app, &self.mailbox_id, &self.side)
                 {
-                    let mut broadcast = self
-                        .state
-                        .write()
-                        .app_mut(&app)
-                        .mailbox_mut(&mailbox_id)
-                        .unwrap()
-                        .broadcast_sender();
+                    if &mailbox != mailbox_id {
+                        Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
+                    } else {
+                        let mut lock = self.state.write();
+                        let claimed_mailbox = lock
+                            .app_mut(&app)
+                            .mailboxes_mut()
+                            .get_mut(&mailbox)
+                            .unwrap();
+                        if claimed_mailbox.open_client(&side) {
+                            self.broadcast_receiver =
+                                Some(claimed_mailbox.new_broadcast_receiver());
+                            self.broadcast_sender = Some(claimed_mailbox.broadcast_sender());
 
+                            Ok(())
+                        } else {
+                            Err(ClientConnectionError::NotConnectedToMailbox(
+                                mailbox.clone(),
+                            ))
+                        }
+                    }
+                } else {
+                    Err(ClientConnectionError::NotClaimedAnyMailbox)
+                }
+            }
+            ClientMessage::Add { phase, body } => {
+                if let (Some(app), Some(mailbox_id), Some(side), Some(sender)) = (
+                    &self.app,
+                    &self.mailbox_id,
+                    &self.side,
+                    &self.broadcast_sender,
+                ) {
                     // send the message to the broadcast channel
-                    broadcast
+                    sender
                         .broadcast(EncryptedMessage {
                             side: side.clone().0.into(),
                             phase: phase.clone(),
