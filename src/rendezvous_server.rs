@@ -15,9 +15,13 @@ use futures::{pending, poll, select, AsyncReadExt, FutureExt, SinkExt, StreamExt
 use parking_lot::Mutex;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
+use std::string::ToString;
 use std::sync::Arc;
 use std::task::Poll;
 use std::time::Duration;
+
+static ADVERTISE_VERSION: Option<&'static str> = Some("0.12.0");
+static MOTD: Option<&'static str> = Some("Welcome to magic-wormhole.rs");
 
 // How often should mailboxes be cleaned up?
 const CLEANUP_INTERVAL: Duration = Duration::from_secs(60);
@@ -169,8 +173,8 @@ impl<'a> RendezvousServerConnection<'a> {
         #[allow(deprecated)]
         let welcome = ServerMessage::Welcome {
             welcome: WelcomeMessage {
-                current_cli_version: None,
-                motd: None,
+                current_cli_version: ADVERTISE_VERSION.map(|s| s.to_string()),
+                motd: MOTD.map(|s| s.to_string()),
                 error: None,
                 permission_required: None,
             },

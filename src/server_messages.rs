@@ -41,6 +41,7 @@ pub struct WelcomeMessage {
     #[deprecated(note = "This is for the Python client")]
     pub current_cli_version: Option<String>,
     pub motd: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     #[deprecated(note = "Servers should send a proper error message instead")]
     pub error: Option<String>,
     #[serde(rename = "permission-required")]
