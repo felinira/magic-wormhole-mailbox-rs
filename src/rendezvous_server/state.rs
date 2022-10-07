@@ -138,6 +138,10 @@ impl RendezvousServerApp {
         }
     }
 
+    pub fn mailboxes(&self) -> &HashMap<Mailbox, ClaimedMailbox> {
+        &self.mailboxes
+    }
+
     pub fn mailboxes_mut(&mut self) -> &mut HashMap<Mailbox, ClaimedMailbox> {
         &mut self.mailboxes
     }

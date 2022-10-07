@@ -120,8 +120,7 @@ impl RendezvousServer {
                 async_std::task::spawn(async move {
                     let ws = async_tungstenite::accept_async(stream).await;
                     if let Ok(mut ws) = ws {
-                        let mut connection =
-                            RendezvousServerConnection::init_connection(state, &mut ws).await;
+                        let mut connection = RendezvousServerConnection::bind(state, &mut ws).await;
                         if let Ok(mut connection) = connection {
                             connection.handle_connection().await;
                         }
@@ -163,7 +162,7 @@ pub struct RendezvousServerConnection<'a> {
 }
 
 impl<'a> RendezvousServerConnection<'a> {
-    async fn init_connection(
+    async fn bind(
         state: RendezvousServerState,
         websocket: &'a mut WebSocketStream<TcpStream>,
     ) -> Result<RendezvousServerConnection<'a>, ClientConnectionError> {
@@ -203,7 +202,7 @@ impl<'a> RendezvousServerConnection<'a> {
             }
             err => {
                 println!("Message receive error: {}", err);
-                self.handle_error_release(err.into()).await;
+                self.handle_error(err.into()).await;
             }
         }
     }
@@ -268,23 +267,11 @@ impl<'a> RendezvousServerConnection<'a> {
     }
 
     async fn handle_error(&mut self, error: ClientConnectionError) {
-        println!("An error occurred: {}", error);
-        println!("Backtrace: {:?}", backtrace::Backtrace::new());
-
-        if !self.websocket.is_terminated() {
-            self.send_msg(&ServerMessage::Error {
-                error: error.to_string(),
-                orig: Box::new(ServerMessage::Unknown),
-            })
-            .await;
-        }
-    }
-
-    async fn handle_error_release(&mut self, error: ClientConnectionError) {
         self.handle_error(error);
 
         if let (Some(app), Some(mailbox_id), Some(side)) = (&self.app, &self.mailbox_id, &self.side)
         {
+            // If a mailbox was claimed we release it
             self.state
                 .write()
                 .app_mut(app)
@@ -305,19 +292,6 @@ impl<'a> RendezvousServerConnection<'a> {
                         let client_msg = serde_json::from_str(&msg_txt);
                         if let Ok(client_msg) = client_msg {
                             Self::send_msg_ws(websocket, &ServerMessage::Ack).await?;
-
-                            match client_msg {
-                                ClientMessage::Ping { ping } => {
-                                    Self::send_msg_ws(
-                                        websocket,
-                                        &ServerMessage::Pong { pong: ping },
-                                    )
-                                    .await;
-                                    continue;
-                                }
-                                _ => {}
-                            }
-
                             Ok(client_msg)
                         } else {
                             Err(ReceiveError::JsonParse(msg_txt))
@@ -525,7 +499,30 @@ impl<'a> RendezvousServerConnection<'a> {
                     Err(ClientConnectionError::NotClaimedAnyMailbox)
                 }
             }
-            _ => Err(ClientConnectionError::UnexpectedMessage(client_msg)),
+            ClientMessage::List => {
+                if let Some(app) = &self.app {
+                    let nameplates = self.state.read().app(app).map_or_else(
+                        || Vec::new(),
+                        |app| {
+                            app.mailboxes()
+                                .keys()
+                                .map(|m| Nameplate(m.to_string()))
+                                .collect()
+                        },
+                    );
+                    self.send_msg(&ServerMessage::Nameplates { nameplates });
+                    Ok(())
+                } else {
+                    Err(ClientConnectionError::NotBound)
+                }
+            }
+            ClientMessage::Ping { ping } => {
+                self.send_msg(&ServerMessage::Pong { pong: ping }).await;
+                Ok(())
+            }
+            ClientMessage::SubmitPermission(_) => {
+                Err(ClientConnectionError::UnexpectedMessage(client_msg))
+            }
         }
     }
 }
