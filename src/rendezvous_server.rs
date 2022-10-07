@@ -6,6 +6,7 @@ use self::state::RendezvousServerState;
 use crate::core::{AppID, EitherSide, Mailbox, Nameplate, TheirSide};
 use crate::server_messages::*;
 use async_std::net::TcpStream;
+use async_tungstenite::tungstenite::http::header::IF_NONE_MATCH;
 use async_tungstenite::tungstenite::Error;
 use async_tungstenite::{tungstenite, WebSocketStream};
 use futures::future::err;
@@ -51,6 +52,14 @@ pub enum ClientConnectionError {
         #[source]
         source: tungstenite::Error,
     },
+    #[error("Not bound to any app. Send a bind message first")]
+    NotBound,
+    #[error("Can only bind once")]
+    BindTwice,
+    #[error("Can only allocate once")]
+    AllocateTwice,
+    #[error("Can only claim a mailbox once")]
+    ClaimTwice,
     #[error("Received unexpected message: {}", _0)]
     UnexpectedMessage(ClientMessage),
     #[error("Too many clients connected")]
@@ -147,6 +156,7 @@ pub struct RendezvousServerConnection<'a> {
 
     app: Option<AppID>,
     side: Option<EitherSide>,
+    allocation: Option<Nameplate>,
     mailbox_id: Option<Mailbox>,
     broadcast_receiver: Option<async_broadcast::Receiver<EncryptedMessage>>,
     broadcast_sender: Option<async_broadcast::Sender<EncryptedMessage>>,
@@ -169,84 +179,13 @@ impl<'a> RendezvousServerConnection<'a> {
 
         Self::send_msg_ws(websocket, &welcome).await?;
 
-        let msg = Self::receive_msg_ws(websocket).await?;
-        let (app, side) = match msg {
-            ClientMessage::Bind { appid, side } => (appid, EitherSide(side.0.clone())),
-            _ => {
-                return Err(ClientConnectionError::UnexpectedMessage(msg));
-            }
-        };
-
-        let mut claimed = false;
-        let mut mailbox_id = Mailbox(String::new());
-
-        while !claimed {
-            // Allocate or claim are the only two messages that can come now
-            let msg = Self::receive_msg_ws(websocket).await?;
-            match &msg {
-                ClientMessage::Allocate => {
-                    let allocation = state.write().app_mut(&app).allocate(&side);
-
-                    if let Some(allocation) = allocation {
-                        Self::send_msg_ws(
-                            websocket,
-                            &ServerMessage::Allocated {
-                                nameplate: Nameplate::new(&allocation),
-                            },
-                        )
-                        .await?;
-                    } else {
-                        return Err(ClientConnectionError::UnexpectedMessage(msg));
-                    }
-                }
-                ClientMessage::Claim { nameplate } => {
-                    println!("Claiming nameplate: {}", nameplate);
-
-                    if state
-                        .write()
-                        .app_mut(&app)
-                        .try_claim(&Nameplate(nameplate.to_string()), side.clone())
-                        .is_none()
-                    {
-                        return Err(ClientConnectionError::TooManyClients);
-                    } else {
-                        Self::send_msg_ws(
-                            websocket,
-                            &ServerMessage::Claimed {
-                                mailbox: Mailbox(nameplate.to_string()),
-                            },
-                        )
-                        .await?;
-                        claimed = true;
-                        mailbox_id = Mailbox(nameplate.to_string());
-                    }
-                }
-                _ => {
-                    return Err(ClientConnectionError::UnexpectedMessage(msg));
-                }
-            };
-        }
-        /*
-                let msg = Self::receive_msg_ws(websocket).await?;
-                match &msg {
-                    _ => {
-                        return Err(ClientConnectionError::UnexpectedMessage(msg));
-                    }
-                }
-
-                let broadcast_receiver = state
-                    .write()
-                    .app_mut(&app)
-                    .mailbox_mut(&mailbox_id)
-                    .unwrap()
-                    .new_broadcast_receiver();
-        */
         Ok(Self {
             state,
             websocket,
-            app: Some(app),
-            side: Some(side),
-            mailbox_id: Some(mailbox_id),
+            app: None,
+            side: None,
+            allocation: None,
+            mailbox_id: None,
             broadcast_receiver: None,
             broadcast_sender: None,
         })
@@ -405,6 +344,65 @@ impl<'a> RendezvousServerConnection<'a> {
         client_msg: ClientMessage,
     ) -> Result<(), ClientConnectionError> {
         match client_msg {
+            ClientMessage::Bind { appid, side } => {
+                if self.app.is_some() {
+                    Err(ClientConnectionError::BindTwice)
+                } else {
+                    self.app = Some(appid);
+                    self.side = Some(EitherSide(side.0.clone()));
+                    Ok(())
+                }
+            }
+            ClientMessage::Allocate => {
+                if let (Some(app), Some(side)) = (&self.app, &self.side) {
+                    if self.allocation.is_some() {
+                        Err(ClientConnectionError::AllocateTwice)
+                    } else {
+                        let allocation = self.state.write().app_mut(&app).allocate(&side);
+
+                        if let Some(allocation) = allocation {
+                            self.send_msg(&ServerMessage::Allocated {
+                                nameplate: Nameplate::new(&allocation),
+                            })
+                            .await?;
+                            Ok(())
+                        } else {
+                            Err(ClientConnectionError::Inconsistency)
+                        }
+                    }
+                } else {
+                    Err(ClientConnectionError::NotBound)
+                }
+            }
+            ClientMessage::Claim { nameplate } => {
+                if let (Some(app), Some(side)) = (&self.app, &self.side) {
+                    if self.mailbox_id.is_some() {
+                        Err(ClientConnectionError::ClaimTwice)
+                    } else {
+                        println!("Claiming mailbox: {}", nameplate);
+
+                        if self
+                            .state
+                            .write()
+                            .app_mut(&app)
+                            .try_claim(&Nameplate(nameplate.to_string()), side.clone())
+                            .is_none()
+                        {
+                            Err(ClientConnectionError::TooManyClients)
+                        } else {
+                            let mailbox_id = Mailbox(nameplate.to_string());
+                            self.mailbox_id = Some(mailbox_id.clone());
+                            self.send_msg(&ServerMessage::Claimed {
+                                mailbox: mailbox_id,
+                            })
+                            .await?;
+                            Ok(())
+                        }
+                    }
+                } else {
+                    Err(ClientConnectionError::NotBound)
+                }
+            }
             ClientMessage::Open { mailbox } => {
                 if let (Some(app), Some(mailbox_id), Some(side)) =
                     (&self.app, &self.mailbox_id, &self.side)
