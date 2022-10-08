@@ -5,12 +5,13 @@ use crate::rendezvous_server::nameplate::ClaimedNameplate;
 use derive_more::Deref;
 use parking_lot::RwLock;
 use rand::distributions::DistString;
+use rand::Rng;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
 // Limit of max open nameplate allocations
-const MAX_NAMEPLATES: usize = 1024;
+const MAX_NAMEPLATES: usize = 1024 * 1024;
 
 // Two hour old nameplate claims will get deleted
 const MAX_NAMEPLATE_CLAIM_TIME: std::time::Duration = Duration::from_secs(60 * 60 * 2);
@@ -51,32 +52,42 @@ impl RendezvousServerApp {
             return None;
         }
 
-        for key in 1..MAX_NAMEPLATES {
+        for count in 1..1000 + 1000 {
+            let key = if count < MAX_NAMEPLATES {
+                count
+            } else {
+                rand::thread_rng().gen_range(1000..1000000)
+            };
+
             let nameplate = Nameplate(key.to_string());
-            if !self.allocations.contains_key(&nameplate) && self
+            if !self.allocations.contains_key(&nameplate)
+                && self
                     .claim_nameplate(&Nameplate(key.to_string()), side)
-                    .is_some() {
+                    .is_some()
+            {
                 return Some(Nameplate(key.to_string()));
             }
         }
+
+        // use random values for a while
 
         // MAX_ALLOCATIONS reached
         None
     }
 
     pub fn claim_nameplate(&mut self, nameplate: &Nameplate, side: &EitherSide) -> Option<Mailbox> {
-        let claimed_nameplate =
-            if let Some(claimed_nameplate) = self.allocations.get_mut(nameplate) {
-                claimed_nameplate
-            } else {
-                let mailbox_id = self.generate_mailbox_id();
-                self.add_or_get_mailbox(&mailbox_id, Some(nameplate));
+        let claimed_nameplate = if let Some(claimed_nameplate) = self.allocations.get_mut(nameplate)
+        {
+            claimed_nameplate
+        } else {
+            let mailbox_id = self.generate_mailbox_id();
+            self.add_or_get_mailbox(&mailbox_id, Some(nameplate));
 
-                let claimed_nameplate = ClaimedNameplate::new(mailbox_id);
-                self.allocations
-                    .entry(nameplate.clone())
-                    .or_insert(claimed_nameplate)
-            };
+            let claimed_nameplate = ClaimedNameplate::new(mailbox_id);
+            self.allocations
+                .entry(nameplate.clone())
+                .or_insert(claimed_nameplate)
+        };
 
         claimed_nameplate.add_client(side.clone());
         Some(claimed_nameplate.mailbox().clone())
