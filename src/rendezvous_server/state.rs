@@ -54,11 +54,14 @@ impl RendezvousServerApp {
         }
 
         for key in 1..MAX_NAMEPLATES {
-            if self
-                .claim_nameplate(&Nameplate(key.to_string()), &side)
-                .is_some()
-            {
-                return Some(Nameplate(key.to_string()));
+            let nameplate = Nameplate(key.to_string());
+            if !self.allocations.contains_key(&nameplate) {
+                if self
+                    .claim_nameplate(&Nameplate(key.to_string()), &side)
+                    .is_some()
+                {
+                    return Some(Nameplate(key.to_string()));
+                }
             }
         }
 
@@ -89,6 +92,10 @@ impl RendezvousServerApp {
             if claimed_nameplate.remove_client(client_id) {
                 if claimed_nameplate.is_empty() {
                     // Cleanup nameplate
+                    if let Some(mailbox) = self.mailboxes.get_mut(&claimed_nameplate.mailbox()) {
+                        mailbox.remove_nameplate();
+                    }
+
                     self.allocations.remove(nameplate_id);
                 }
 
@@ -142,22 +149,45 @@ impl RendezvousServerApp {
     }
 
     pub fn cleanup_allocations(&mut self) {
-        self.allocations.retain(|_nameplate, claimed_nameplate| {
-            if claimed_nameplate.is_empty() {
-                return false;
+        self.allocations.retain(|nameplate, claimed_nameplate| {
+            let retain = {
+                if claimed_nameplate.is_empty() {
+                    println!("Nameplate {} is empty", nameplate.0);
+                    return false;
+                }
+
+                // Two hours is maximum nameplate claim time
+                if claimed_nameplate.creation_time().elapsed() > MAX_NAMEPLATE_CLAIM_TIME
+                    && !claimed_nameplate.is_full()
+                {
+                    println!(
+                        "Removed Nameplate {}: Too old and without any peer",
+                        nameplate.0
+                    );
+                    false
+                } else {
+                    true
+                }
+            };
+
+            if !retain {
+                println!("Cleanup nameplate {}", nameplate.0);
+                if let Some(mailbox) = self.mailboxes.get_mut(claimed_nameplate.mailbox()) {
+                    mailbox.remove_nameplate();
+                }
             }
 
-            // Two hours is maximum nameplate claim time
-            if claimed_nameplate.creation_time().elapsed() > MAX_NAMEPLATE_CLAIM_TIME {
-                true
-            } else {
-                false
-            }
+            retain
         });
     }
 
     pub fn cleanup_mailboxes(&mut self) {
         self.mailboxes.retain(|nameplate, mailbox| {
+            if mailbox.nameplate().is_some() {
+                // If the mailbox has a claimed nameplate leave it alone
+                return true;
+            }
+
             if mailbox.should_cleanup() {
                 println!("Removed mailbox {}: Empty", nameplate);
                 return false;
@@ -200,6 +230,10 @@ impl RendezvousServerApp {
 
     pub fn mailbox_mut(&mut self, mailbox_id: &Mailbox) -> Option<&mut ClaimedMailbox> {
         self.mailboxes.get_mut(mailbox_id)
+    }
+
+    pub fn allocations(&self) -> &HashMap<Nameplate, ClaimedNameplate> {
+        &self.allocations
     }
 
     pub fn allocations_mut(&mut self) -> &mut HashMap<Nameplate, ClaimedNameplate> {

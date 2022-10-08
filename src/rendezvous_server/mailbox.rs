@@ -35,11 +35,18 @@ impl ClaimedMailbox {
         self.nameplate.as_ref()
     }
 
+    pub fn remove_nameplate(&mut self) {
+        self.nameplate = None
+    }
+
     pub fn add_client(&mut self, client_id: EitherSide) -> bool {
-        if self.is_full() {
-            false
+        if self.clients.contains(&client_id) {
+            true
+        } else if !self.is_full() {
+            self.clients.insert(client_id);
+            true
         } else {
-            self.clients.insert(client_id)
+            false
         }
     }
 

@@ -1,5 +1,5 @@
 #![deny(unused_must_use)]
-#![allow(unused)]
+#![allow(dead_code)]
 
 use crate::zeroconf::{ZeroconfBrowser, ZeroconfService};
 use futures::{select, FutureExt};
