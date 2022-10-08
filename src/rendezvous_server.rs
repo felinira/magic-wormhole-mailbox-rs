@@ -212,6 +212,19 @@ impl<'a> RendezvousServerConnection<'a> {
 
                 let _ = self.websocket.close(close_frame).await;
             }
+            ReceiveError::WebSocket {
+                source:
+                    tungstenite::Error::Protocol(
+                        tungstenite::error::ProtocolError::ResetWithoutClosingHandshake,
+                    ),
+            } => {
+                println!(
+                    "Connection closed by side {} without closing websocket handshake",
+                    self.side.as_ref().unwrap_or(&EitherSide("???".to_string()))
+                );
+
+                let _ = self.websocket.close(None).await;
+            }
             err => {
                 println!("Message receive error: {}", err);
                 self.handle_error(err.into()).await;
@@ -466,7 +479,6 @@ impl<'a> RendezvousServerConnection<'a> {
                     &self.side,
                     &self.broadcast_sender,
                 ) {
-                    println!("Sending msg ({phase}) to broadcast channel");
                     // send the message to the broadcast channel
                     sender
                         .broadcast(EncryptedMessage {
@@ -487,10 +499,6 @@ impl<'a> RendezvousServerConnection<'a> {
                         ))
                     }
                 } else {
-                    println!(
-                        "Not claimed! {:?}, {:?}, {:?}, {:?}",
-                        self.app, self.mailbox_id, self.side, self.broadcast_sender
-                    );
                     Err(ClientConnectionError::NotClaimedAnyMailbox)
                 }
             }
