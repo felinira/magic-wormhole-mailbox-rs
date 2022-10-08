@@ -53,13 +53,10 @@ impl RendezvousServerApp {
 
         for key in 1..MAX_NAMEPLATES {
             let nameplate = Nameplate(key.to_string());
-            if !self.allocations.contains_key(&nameplate) {
-                if self
-                    .claim_nameplate(&Nameplate(key.to_string()), &side)
-                    .is_some()
-                {
-                    return Some(Nameplate(key.to_string()));
-                }
+            if !self.allocations.contains_key(&nameplate) && self
+                    .claim_nameplate(&Nameplate(key.to_string()), side)
+                    .is_some() {
+                return Some(Nameplate(key.to_string()));
             }
         }
 
@@ -69,11 +66,11 @@ impl RendezvousServerApp {
 
     pub fn claim_nameplate(&mut self, nameplate: &Nameplate, side: &EitherSide) -> Option<Mailbox> {
         let claimed_nameplate =
-            if let Some(claimed_nameplate) = self.allocations.get_mut(&nameplate) {
+            if let Some(claimed_nameplate) = self.allocations.get_mut(nameplate) {
                 claimed_nameplate
             } else {
                 let mailbox_id = self.generate_mailbox_id();
-                self.add_or_get_mailbox(&mailbox_id, Some(&nameplate));
+                self.add_or_get_mailbox(&mailbox_id, Some(nameplate));
 
                 let claimed_nameplate = ClaimedNameplate::new(mailbox_id);
                 self.allocations
@@ -90,7 +87,7 @@ impl RendezvousServerApp {
             if claimed_nameplate.remove_client(client_id) {
                 if claimed_nameplate.is_empty() {
                     // Cleanup nameplate
-                    if let Some(mailbox) = self.mailboxes.get_mut(&claimed_nameplate.mailbox()) {
+                    if let Some(mailbox) = self.mailboxes.get_mut(claimed_nameplate.mailbox()) {
                         mailbox.remove_nameplate();
                     }
 

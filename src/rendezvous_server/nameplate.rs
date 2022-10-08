@@ -47,7 +47,7 @@ impl ClaimedNameplate {
             false
         } else {
             self.clients
-                .insert(side.clone(), ClaimedNameplateSide::new());
+                .insert(side, ClaimedNameplateSide::new());
             true
         }
     }

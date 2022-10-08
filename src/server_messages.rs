@@ -107,7 +107,7 @@ pub struct HashcashPermission {
     pub resource: String,
 }
 
-#[derive(Debug, PartialEq, Clone, Serialize, Deserialize, derive_more::Display)]
+#[derive(Debug, PartialEq, Eq, Clone, Serialize, Deserialize, derive_more::Display)]
 #[display(
     fmt = "EncryptedMessage {{ side: {}, phase: {}, body: {:?}",
     side,
@@ -125,7 +125,7 @@ pub struct EncryptedMessage {
 }
 
 // Client sends only these
-#[derive(Serialize, Deserialize, Debug, PartialEq, derive_more::Display)]
+#[derive(Serialize, Deserialize, Debug, PartialEq, Eq, derive_more::Display)]
 #[serde(rename_all = "kebab-case")]
 #[serde(tag = "type")]
 pub enum ClientMessage {

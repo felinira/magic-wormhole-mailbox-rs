@@ -374,7 +374,7 @@ impl<'a> RendezvousServerConnection<'a> {
                     if self.allocation.is_some() {
                         Err(ClientConnectionError::AllocateTwice)
                     } else {
-                        let allocation = self.state.write().app_mut(app).allocate_nameplate(&side);
+                        let allocation = self.state.write().app_mut(app).allocate_nameplate(side);
 
                         if let Some(allocation) = allocation {
                             self.send_msg(&ServerMessage::Allocated {
@@ -402,7 +402,7 @@ impl<'a> RendezvousServerConnection<'a> {
                             .state
                             .write()
                             .app_mut(app)
-                            .claim_nameplate(&nameplate, &side);
+                            .claim_nameplate(&nameplate, side);
                         self.mailbox_id = mailbox;
                         if let Some(mailbox) = &self.mailbox_id {
                             self.send_msg(&ServerMessage::Claimed {
@@ -440,7 +440,7 @@ impl<'a> RendezvousServerConnection<'a> {
             ClientMessage::Open { mailbox } => {
                 if let (Some(app), Some(side)) = (&self.app, &self.side) {
                     let mut lock = self.state.write();
-                    if let Some(mailbox) = lock.app_mut(app).open_mailbox(&mailbox, &side) {
+                    if let Some(mailbox) = lock.app_mut(app).open_mailbox(&mailbox, side) {
                         println!("Open mailbox: {}", mailbox.0);
                         let claimed_mailbox =
                             lock.app_mut(app).mailboxes_mut().get_mut(&mailbox).unwrap();
