@@ -7,7 +7,7 @@ pub(crate) struct ClaimedNameplateSide {
 }
 
 impl ClaimedNameplateSide {
-    pub fn new(side: EitherSide) -> Self {
+    pub fn new() -> Self {
         Self {
             creation_date: std::time::Instant::now(),
             claimed: true,
@@ -47,7 +47,7 @@ impl ClaimedNameplate {
             false
         } else {
             self.clients
-                .insert(side.clone(), ClaimedNameplateSide::new(side));
+                .insert(side.clone(), ClaimedNameplateSide::new());
             true
         }
     }

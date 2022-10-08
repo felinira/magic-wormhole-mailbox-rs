@@ -2,23 +2,14 @@ mod mailbox;
 mod nameplate;
 mod state;
 
-use self::mailbox::ClaimedMailbox;
 use self::state::RendezvousServerState;
-use crate::core::{AppID, EitherSide, Mailbox, Nameplate, TheirSide};
+use crate::core::{AppID, EitherSide, Mailbox, Nameplate};
 use crate::server_messages::*;
 use async_std::net::TcpStream;
-use async_tungstenite::tungstenite::http::header::IF_NONE_MATCH;
-use async_tungstenite::tungstenite::Error;
 use async_tungstenite::{tungstenite, WebSocketStream};
-use futures::future::err;
 use futures::stream::FusedStream;
-use futures::{pending, poll, select, AsyncReadExt, FutureExt, SinkExt, StreamExt};
-use parking_lot::Mutex;
-use std::collections::HashMap;
-use std::fmt::{Display, Formatter};
+use futures::{select, FutureExt, SinkExt, StreamExt};
 use std::string::ToString;
-use std::sync::Arc;
-use std::task::Poll;
 use std::time::Duration;
 
 static ADVERTISE_VERSION: Option<&'static str> = Some("0.12.0");
@@ -129,7 +120,7 @@ impl RendezvousServer {
                 async_std::task::spawn(async move {
                     let ws = async_tungstenite::accept_async(stream).await;
                     if let Ok(mut ws) = ws {
-                        let mut connection = RendezvousServerConnection::bind(state, &mut ws).await;
+                        let connection = RendezvousServerConnection::bind(state, &mut ws).await;
                         if let Ok(mut connection) = connection {
                             if let Err(err) = connection.handle_connection().await {
                                 println!("Connection error: {}", err);
@@ -138,12 +129,10 @@ impl RendezvousServer {
 
                         if !ws.is_terminated() {
                             println!("Closing websocket");
-                            let mut res = ws.close(None).await;
-
-                            match res {
+                            match ws.close(None).await {
                                 Ok(()) => {}
                                 Err(err) => {
-                                    if !matches!(tungstenite::Error::ConnectionClosed, err) {
+                                    if !matches!(err, tungstenite::Error::ConnectionClosed) {
                                         println!("Websocket connection error: {}", err);
                                     }
                                 }

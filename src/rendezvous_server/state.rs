@@ -3,11 +3,9 @@ use crate::core::{EitherSide, Mailbox, Nameplate};
 use crate::rendezvous_server::mailbox::ClaimedMailbox;
 use crate::rendezvous_server::nameplate::ClaimedNameplate;
 use derive_more::Deref;
-use parking_lot::{
-    MappedRwLockReadGuard, MappedRwLockWriteGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-};
+use parking_lot::RwLock;
 use rand::distributions::DistString;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,7 +68,7 @@ impl RendezvousServerApp {
     }
 
     pub fn claim_nameplate(&mut self, nameplate: &Nameplate, side: &EitherSide) -> Option<Mailbox> {
-        let mut claimed_nameplate =
+        let claimed_nameplate =
             if let Some(claimed_nameplate) = self.allocations.get_mut(&nameplate) {
                 claimed_nameplate
             } else {
@@ -121,7 +119,7 @@ impl RendezvousServerApp {
         mailbox_id: &Mailbox,
         client_id: &EitherSide,
     ) -> Option<Mailbox> {
-        let mut mailbox = self.add_or_get_mailbox(mailbox_id, None);
+        let mailbox = self.add_or_get_mailbox(mailbox_id, None);
         if mailbox.add_client(client_id.clone()) {
             Some(mailbox_id.clone())
         } else {
@@ -132,7 +130,7 @@ impl RendezvousServerApp {
     pub fn close_mailbox(&mut self, mailbox_id: &Mailbox, client_id: &EitherSide) -> bool {
         println!("Closing mailbox {} for client {}", mailbox_id, client_id);
 
-        let mut claimed_mailbox = self.mailboxes.get_mut(mailbox_id);
+        let claimed_mailbox = self.mailboxes.get_mut(mailbox_id);
         if let Some(claimed_mailbox) = claimed_mailbox {
             if claimed_mailbox.has_client(client_id) {
                 claimed_mailbox.remove_client(client_id);

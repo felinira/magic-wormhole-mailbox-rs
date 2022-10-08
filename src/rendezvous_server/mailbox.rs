@@ -1,5 +1,5 @@
 use crate::core::{EitherSide, Nameplate};
-use crate::server_messages::{EncryptedMessage, ServerMessage};
+use crate::server_messages::EncryptedMessage;
 use std::collections::HashSet;
 
 pub type BroadcastSender = async_broadcast::Sender<EncryptedMessage>;
@@ -17,7 +17,7 @@ pub(crate) struct ClaimedMailbox {
 impl ClaimedMailbox {
     pub fn new(nameplate: Option<Nameplate>) -> Self {
         let now = std::time::Instant::now();
-        let mut clients = HashSet::with_capacity(2);
+        let clients = HashSet::with_capacity(2);
 
         let (broadcast_sender, broadcast_receiver) = async_broadcast::broadcast(1024);
 
