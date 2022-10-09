@@ -90,7 +90,7 @@ impl From<String> for AppID {
     PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display, derive_more::Deref,
 )]
 #[serde(transparent)]
-#[display(fmt = "MySide({})", "&*_0")]
+#[display(fmt = "MySide({})", "&**_0")]
 pub struct MySide(EitherSide);
 
 impl MySide {
@@ -116,7 +116,7 @@ impl MySide {
     PartialEq, Eq, Clone, Debug, Deserialize, Serialize, derive_more::Display, derive_more::Deref,
 )]
 #[serde(transparent)]
-#[display(fmt = "TheirSide({})", "&*_0")]
+#[display(fmt = "TheirSide({})", "&**_0")]
 pub struct TheirSide(EitherSide);
 
 impl<S: Into<String>> From<S> for TheirSide {
@@ -138,7 +138,7 @@ impl<S: Into<String>> From<S> for TheirSide {
 )]
 #[serde(transparent)]
 #[deref(forward)]
-#[display(fmt = "{}", "&*_0")]
+#[display(fmt = "{}", "&**_0")]
 pub struct EitherSide(pub String);
 
 impl<S: Into<String>> From<S> for EitherSide {
@@ -201,9 +201,9 @@ impl Nameplate {
     }
 }
 
-impl Into<String> for Nameplate {
-    fn into(self) -> String {
-        self.0
+impl From<Nameplate> for String {
+    fn from(nameplate: Nameplate) -> Self {
+        nameplate.0
     }
 }
 
