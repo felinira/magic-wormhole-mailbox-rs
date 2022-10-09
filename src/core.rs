@@ -1,4 +1,4 @@
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 use std::borrow::Cow;
 
 // the serialized forms of these variants are part of the wire protocol, so

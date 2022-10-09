@@ -1,5 +1,5 @@
 use crate::core::{AppID, Mailbox, Mood, MySide, Nameplate, Phase, TheirSide};
-use serde::{Deserialize, Serialize};
+use serde_derive::{Deserialize, Serialize};
 use std::collections::HashMap;
 
 /// Special encoding for the `nameplates` message
