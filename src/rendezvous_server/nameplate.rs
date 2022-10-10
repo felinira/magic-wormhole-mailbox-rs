@@ -46,8 +46,7 @@ impl ClaimedNameplate {
         if self.clients.len() >= 2 || self.clients.contains_key(&side) {
             false
         } else {
-            self.clients
-                .insert(side, ClaimedNameplateSide::new());
+            self.clients.insert(side, ClaimedNameplateSide::new());
             true
         }
     }

@@ -113,34 +113,35 @@ impl RendezvousServer {
 
     pub async fn wait_for_connection(&mut self) {
         let mut incoming = self.listener.incoming();
-        while let Some(stream) = incoming.next().await {
-            println!("Connection!");
-            if let Ok(stream) = stream {
-                let state = self.state.clone();
-                async_std::task::spawn(async move {
-                    let ws = async_tungstenite::accept_async(stream).await;
-                    if let Ok(mut ws) = ws {
-                        let connection = RendezvousServerConnection::bind(state, &mut ws).await;
-                        if let Ok(mut connection) = connection {
-                            if let Err(err) = connection.handle_connection().await {
-                                println!("Connection error: {}", err);
-                            }
-                        }
+        while let Some(Ok(stream)) = incoming.next().await {
+            println!("New client connected");
 
-                        if !ws.is_terminated() {
-                            println!("Closing websocket");
-                            match ws.close(None).await {
-                                Ok(()) => {}
-                                Err(err) => {
-                                    if !matches!(err, tungstenite::Error::ConnectionClosed) {
-                                        println!("Websocket connection error: {}", err);
-                                    }
-                                }
+            let state = self.state.clone();
+            async_std::task::spawn(async move {
+                let Ok(mut ws) = async_tungstenite::accept_async(stream).await else {
+                    println!("Connection not a websocket");
+                    return;
+                };
+
+                let connection = RendezvousServerConnection::bind(state, &mut ws).await;
+                if let Ok(mut connection) = connection {
+                    if let Err(err) = connection.handle_connection().await {
+                        println!("Connection error: {}", err);
+                    }
+                }
+
+                if !ws.is_terminated() {
+                    println!("Closing websocket");
+                    match ws.close(None).await {
+                        Ok(()) => {}
+                        Err(err) => {
+                            if !matches!(err, tungstenite::Error::ConnectionClosed) {
+                                println!("Websocket connection error: {}", err);
                             }
                         }
                     }
-                });
-            }
+                }
+            });
         }
     }
 
@@ -370,166 +371,163 @@ impl<'a> RendezvousServerConnection<'a> {
                 }
             }
             ClientMessage::Allocate => {
-                if let (Some(app), Some(side)) = (&self.app, &self.side) {
-                    if self.allocation.is_some() {
-                        Err(ClientConnectionError::AllocateTwice)
-                    } else {
-                        let allocation = self.state.write().app_mut(app).allocate_nameplate(side);
+                let (Some(app), Some(side)) = (&self.app, &self.side) else {
+                    return Err(ClientConnectionError::NotBound);
+                };
 
-                        if let Some(allocation) = allocation {
-                            self.send_msg(&ServerMessage::Allocated {
-                                nameplate: Nameplate::new(&allocation),
-                            })
-                            .await?;
-                            Ok(())
-                        } else {
-                            Err(ClientConnectionError::Inconsistency)
-                        }
-                    }
-                } else {
-                    Err(ClientConnectionError::NotBound)
+                if self.allocation.is_some() {
+                    return Err(ClientConnectionError::AllocateTwice);
                 }
+
+                let Some(allocation) = self.state.write().app_mut(app).allocate_nameplate(side) else {
+                    return Err(ClientConnectionError::Inconsistency);
+                };
+
+                self.send_msg(&ServerMessage::Allocated {
+                    nameplate: Nameplate::new(&allocation),
+                })
+                .await?;
+
+                Ok(())
             }
             ClientMessage::Claim { nameplate } => {
-                if let (Some(app), Some(side)) = (&self.app, &self.side) {
-                    if self.mailbox_id.is_some() {
-                        Err(ClientConnectionError::ClaimTwice)
-                    } else {
-                        println!("Claiming nameplate: {}", nameplate);
-                        let nameplate = Nameplate(nameplate);
+                let (Some(app), Some(side)) = (&self.app, &self.side) else {
+                    return Err(ClientConnectionError::NotBound);
+                };
 
-                        let mailbox = self
-                            .state
-                            .write()
-                            .app_mut(app)
-                            .claim_nameplate(&nameplate, side);
-                        self.mailbox_id = mailbox;
-                        if let Some(mailbox) = &self.mailbox_id {
-                            self.send_msg(&ServerMessage::Claimed {
-                                mailbox: mailbox.clone(),
-                            })
-                            .await?;
-                            Ok(())
-                        } else {
-                            Err(ClientConnectionError::TooManyClients)
-                        }
-                    }
-                } else {
-                    Err(ClientConnectionError::NotBound)
+                if self.mailbox_id.is_some() {
+                    return Err(ClientConnectionError::ClaimTwice);
                 }
+
+                println!("Claiming nameplate: {}", nameplate);
+                let nameplate = Nameplate(nameplate);
+
+                let Some(mailbox) = self
+                    .state
+                    .write()
+                    .app_mut(app)
+                    .claim_nameplate(&nameplate, side) else {
+                    return Err(ClientConnectionError::TooManyClients)
+                };
+
+                self.mailbox_id = Some(mailbox.clone());
+                self.send_msg(&ServerMessage::Claimed {
+                    mailbox: mailbox.clone(),
+                })
+                .await?;
+                Ok(())
             }
             ClientMessage::Release { nameplate } => {
-                if let (Some(app), Some(side)) = (&self.app, &self.side) {
-                    let nameplate = Nameplate(nameplate);
-                    if self
-                        .state
-                        .write()
-                        .app_mut(app)
-                        .release_nameplate(&nameplate, side)
-                    {
-                        println!("Releasing nameplate {}", nameplate.0);
-                        self.send_msg(&ServerMessage::Released).await?;
-                        Ok(())
-                    } else {
-                        Err(ClientConnectionError::NotClaimed(nameplate))
-                    }
-                } else {
-                    Err(ClientConnectionError::NotClaimedAnyMailbox)
+                let (Some(app), Some(side)) = (&self.app, &self.side) else {
+                    return Err(ClientConnectionError::NotClaimedAnyMailbox);
+                };
+
+                let nameplate = Nameplate(nameplate);
+
+                if !self
+                    .state
+                    .write()
+                    .app_mut(app)
+                    .release_nameplate(&nameplate, side)
+                {
+                    return Err(ClientConnectionError::NotClaimed(nameplate));
                 }
+
+                println!("Releasing nameplate {}", nameplate.0);
+                self.send_msg(&ServerMessage::Released).await?;
+                Ok(())
             }
             ClientMessage::Open { mailbox } => {
-                if let (Some(app), Some(side)) = (&self.app, &self.side) {
-                    let mut lock = self.state.write();
-                    if let Some(mailbox) = lock.app_mut(app).open_mailbox(&mailbox, side) {
-                        println!("Open mailbox: {}", mailbox.0);
-                        let claimed_mailbox =
-                            lock.app_mut(app).mailboxes_mut().get_mut(&mailbox).unwrap();
-                        self.mailbox_id = Some(mailbox);
+                let (Some(app), Some(side)) = (&self.app, &self.side) else {
+                    return Err(ClientConnectionError::NotClaimedAnyMailbox);
+                };
 
-                        println!("Broadcast channel created for side {}", side);
-                        self.broadcast_receiver = Some(claimed_mailbox.new_broadcast_receiver());
-                        self.broadcast_sender = Some(claimed_mailbox.broadcast_sender());
+                let mut lock = self.state.write();
+                let Some(mailbox) = lock.app_mut(app).open_mailbox(&mailbox, side) else {
+                    return Err(ClientConnectionError::NotConnectedToMailbox(
+                        mailbox.clone(),
+                    ));
+                };
 
-                        Ok(())
-                    } else {
-                        Err(ClientConnectionError::NotConnectedToMailbox(
-                            mailbox.clone(),
-                        ))
-                    }
-                } else {
-                    Err(ClientConnectionError::NotClaimedAnyMailbox)
-                }
+                println!("Open mailbox: {}", mailbox.0);
+                let claimed_mailbox = lock.app_mut(app).mailboxes_mut().get_mut(&mailbox).unwrap();
+                self.mailbox_id = Some(mailbox);
+
+                println!("Broadcast channel created for side {}", side);
+                self.broadcast_receiver = Some(claimed_mailbox.new_broadcast_receiver());
+                self.broadcast_sender = Some(claimed_mailbox.broadcast_sender());
+
+                Ok(())
             }
             ClientMessage::Add { phase, body } => {
                 println!("Received Add!");
-                if let (Some(app), Some(mailbox_id), Some(side), Some(sender)) = (
+                let (Some(app), Some(mailbox_id), Some(side), Some(sender)) = (
                     &self.app,
                     &self.mailbox_id,
                     &self.side,
                     &self.broadcast_sender,
-                ) {
-                    // send the message to the broadcast channel
-                    sender
-                        .broadcast(EncryptedMessage {
-                            side: side.clone().0.into(),
-                            phase: phase.clone(),
-                            body: body.clone(),
-                        })
-                        .await
-                        .unwrap();
+                ) else {
+                    return                     Err(ClientConnectionError::NotClaimedAnyMailbox);
+                };
 
-                    if let Some(mailbox) = self.state.write().app_mut(app).mailbox_mut(mailbox_id) {
-                        // update last activity timestamp
-                        mailbox.update_last_activity();
-                        Ok(())
-                    } else {
-                        Err(ClientConnectionError::NotConnectedToMailbox(
-                            mailbox_id.clone(),
-                        ))
-                    }
-                } else {
-                    Err(ClientConnectionError::NotClaimedAnyMailbox)
-                }
+                // send the message to the broadcast channel
+                sender
+                    .broadcast(EncryptedMessage {
+                        side: side.clone().0.into(),
+                        phase: phase.clone(),
+                        body: body.clone(),
+                    })
+                    .await
+                    .unwrap();
+
+                let mut lock = self.state.write();
+                let Some(mailbox) = lock.app_mut(app).mailbox_mut(mailbox_id) else {
+                    return Err(ClientConnectionError::NotConnectedToMailbox(
+                        mailbox_id.clone(),
+                    ));
+                };
+
+                // update last activity timestamp
+                mailbox.update_last_activity();
+                Ok(())
             }
             ClientMessage::Close { mailbox, mood } => {
-                if let (Some(app), Some(mailbox_id), Some(side)) =
-                    (&self.app, &self.mailbox_id, &self.side)
-                {
-                    if &mailbox != mailbox_id {
-                        Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
-                    } else {
-                        println!("Closed mailbox for client: {}. Mood: {}", side, mood);
-                        let closed = self
-                            .state
-                            .write()
-                            .app_mut(app)
-                            .close_mailbox(mailbox_id, side);
+                let (Some(app), Some(mailbox_id), Some(side)) =
+                    (&self.app, &self.mailbox_id, &self.side) else {
+                    return Err(ClientConnectionError::NotClaimedAnyMailbox)
+                };
 
-                        if closed {
-                            self.send_msg(&ServerMessage::Closed).await?;
-                            Ok(())
-                        } else {
-                            Err(ClientConnectionError::NotConnectedToMailbox(mailbox))
-                        }
-                    }
-                } else {
-                    Err(ClientConnectionError::NotClaimedAnyMailbox)
+                if &mailbox != mailbox_id {
+                    return Err(ClientConnectionError::NotConnectedToMailbox(mailbox));
                 }
+
+                println!("Closed mailbox for client: {}. Mood: {}", side, mood);
+                if !self
+                    .state
+                    .write()
+                    .app_mut(app)
+                    .close_mailbox(mailbox_id, side)
+                {
+                    return Err(ClientConnectionError::NotConnectedToMailbox(mailbox));
+                }
+
+                self.send_msg(&ServerMessage::Closed).await?;
+                Ok(())
             }
             ClientMessage::List => {
-                if let Some(app) = &self.app {
-                    let nameplates = self
-                        .state
-                        .read()
-                        .app(app)
-                        .map(|app| app.allocations().keys().cloned().collect())
-                        .unwrap_or_default();
-                    self.send_msg(&ServerMessage::Nameplates { nameplates })
-                        .await?;
-                    Ok(())
-                } else {
-                    Err(ClientConnectionError::NotBound)
-                }
+                let Some(app) = &self.app else {
+                    return Err(ClientConnectionError::NotBound);
+                };
+
+                let nameplates = self
+                    .state
+                    .read()
+                    .app(app)
+                    .map(|app| app.allocations().keys().cloned().collect())
+                    .unwrap_or_default();
+                self.send_msg(&ServerMessage::Nameplates { nameplates })
+                    .await?;
+                Ok(())
             }
             ClientMessage::Ping { ping } => {
                 self.send_msg(&ServerMessage::Pong { pong: ping }).await?;
